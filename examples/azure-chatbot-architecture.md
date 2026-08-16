@@ -68,23 +68,21 @@ flowchart TB
 Factory functions, constructors, and dependency injection wiring. Shows how service instances and client connections are assembled during startup.
 
 ```mermaid
-flowchart LR
+flowchart TB
     subgraph CP_src["HTTP service Control Plane"]
-        C_BlobStore["BlobStore"]
-        C_CosmosStore["CosmosStore"]
-        C_FoundryAgent["FoundryAgent"]
-        C_GraphIndex["GraphIndex"]
-        C_SecretReader["SecretReader"]
-        C_Telemetry["Telemetry"]
-        C_create_app["create_app"]
-        C_create_blob_store["create_blob_store"]
-        C_create_cosmos_store["create_cosmos_store"]
-        C_create_foundry_agent["create_foundry_agent"]
-        C_create_graph_index["create_graph_index"]
-        C_create_secret_reader["create_secret_reader"]
-        C_create_telemetry["create_telemetry"]
-        C_chat["chat"]
-        C_health["health"]
+        C_create_app["create_app()"]
+        C_create_blob_store["create_blob_store()"]
+        C_create_cosmos_store["create_cosmos_store()"]
+        C_create_foundry_agent["create_foundry_agent()"]
+        C_create_graph_index["create_graph_index()"]
+        C_create_secret_reader["create_secret_reader()"]
+        C_create_telemetry["create_telemetry()"]
+        C_BlobStore["BlobStore()"]
+        C_CosmosStore["CosmosStore()"]
+        C_FoundryAgent["FoundryAgent()"]
+        C_GraphIndex["GraphIndex()"]
+        C_SecretReader["SecretReader()"]
+        C_Telemetry["Telemetry()"]
     end
     C_create_app -->|owns| C_create_blob_store
     C_create_app -->|owns| C_create_cosmos_store
@@ -98,18 +96,6 @@ flowchart LR
     C_create_graph_index -->|owns| C_GraphIndex
     C_create_secret_reader -->|owns| C_SecretReader
     C_create_telemetry -->|owns| C_Telemetry
-    C_chat -->|owns| C_create_blob_store
-    C_chat -->|owns| C_create_cosmos_store
-    C_chat -->|owns| C_create_graph_index
-    C_chat -->|owns| C_create_secret_reader
-    C_chat -->|owns| C_create_telemetry
-    C_chat -->|owns| C_create_foundry_agent
-    C_health -->|owns| C_create_blob_store
-    C_health -->|owns| C_create_cosmos_store
-    C_health -->|owns| C_create_graph_index
-    C_health -->|owns| C_create_secret_reader
-    C_health -->|owns| C_create_telemetry
-    C_health -->|owns| C_create_foundry_agent
 ```
 
 ---
@@ -120,50 +106,21 @@ Runtime data-flow topology. Shows how client components pass intermediate data (
 
 ```mermaid
 flowchart LR
-    subgraph DP_src["HTTP service Runtime"]
+    subgraph Ingress["Request Ingress"]
+        C_chat["chat()"]
+    end
+    subgraph Pipeline["Data Processing & Storage Pipeline"]
         C_BlobStore["BlobStore"]
         C_CosmosStore["CosmosStore"]
         C_FoundryAgent["FoundryAgent"]
         C_GraphIndex["GraphIndex"]
         C_SecretReader["SecretReader"]
         C_Telemetry["Telemetry"]
-        C_create_app["create_app"]
-        C_create_blob_store["create_blob_store"]
-        C_create_cosmos_store["create_cosmos_store"]
-        C_create_foundry_agent["create_foundry_agent"]
-        C_create_graph_index["create_graph_index"]
-        C_create_secret_reader["create_secret_reader"]
-        C_create_telemetry["create_telemetry"]
-        C_chat["chat"]
-        C_health["health"]
     end
-    subgraph DP_Externals["External Dependencies & Services"]
-        X_azure_ai_projects(["azure.ai.projects"])
-        X_azure_cosmos(["azure.cosmos"])
-        X_azure_identity(["azure.identity"])
-        X_azure_keyvault_secrets(["azure.keyvault.secrets"])
-        X_azure_monitor_opentelemetry(["azure.monitor.opentelemetry"])
-        X_azure_monitor_query(["azure.monitor.query"])
-        X_azure_storage_blob(["azure.storage.blob"])
-        X_fastapi(["fastapi"])
-        X_gremlin_python_driver_driver_remote_connection(["gremlin_python.driver.driver_remote_connection"])
-        X_Local_disk_files(["Local disk files"])
-    end
+    C_chat -->|calls| C_Telemetry
     C_GraphIndex -->|neighbors| C_FoundryAgent
-    C_FoundryAgent -->|answer| C_CosmosStore
     C_BlobStore -->|attachments| C_CosmosStore
-    C_create_graph_index -->|DriverRemoteConnection| X_gremlin_python_driver_driver_remote_connection
-    C_create_telemetry -->|DefaultAzureCredential| X_azure_identity
-    C_create_telemetry -->|configure_azure_monitor| X_azure_monitor_opentelemetry
-    C_create_telemetry -->|LogsQueryClient| X_azure_monitor_query
-    C_create_secret_reader -->|SecretClient| X_azure_keyvault_secrets
-    C_create_app -->|FastAPI| X_fastapi
-    C_create_app -->|DefaultAzureCredential| X_azure_identity
-    C_create_cosmos_store -->|CosmosClient| X_azure_cosmos
-    C_create_foundry_agent -->|AIProjectClient| X_azure_ai_projects
-    C_create_foundry_agent -->|DefaultAzureCredential| X_azure_identity
-    C_create_blob_store -->|BlobServiceClient| X_azure_storage_blob
-    C_BlobStore -.->|fs| X_Local_disk_files
+    C_FoundryAgent -->|answer| C_CosmosStore
 ```
 
 Function → import bindings:
@@ -187,8 +144,8 @@ Extracted client-to-client data edges (from AST):
 | Source Component | Target Component | Passed Variable / Data |
 | :--- | :--- | :--- |
 | `GraphIndex` | `FoundryAgent` | `neighbors` |
-| `FoundryAgent` | `CosmosStore` | `answer` |
 | `BlobStore` | `CosmosStore` | `attachments` |
+| `FoundryAgent` | `CosmosStore` | `answer` |
 
 ---
 

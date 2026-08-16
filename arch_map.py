@@ -40,6 +40,12 @@ OPS_DIR_NAMES = {"scripts", "script", "bin", "tooling"}
 JS_EXTS = {".js", ".ts", ".tsx", ".jsx", ".mjs", ".cjs"}
 SCAN_EXTS = JS_EXTS | {".py", ".rs", ".go", ".swift", ".cpp", ".h", ".sh"}
 
+BUILTIN_CLASSES = {
+    "Set", "Map", "WeakMap", "WeakSet", "Date", "Error", "TypeError", "RangeError",
+    "SyntaxError", "ReferenceError", "RegExp", "Promise", "URL", "URLSearchParams",
+    "Buffer", "Array", "Object", "String", "Number", "Boolean", "Function", "Symbol",
+}
+
 BUILTIN_MODULES = {
     "fs", "path", "http", "https", "crypto", "url", "os", "events", "stream",
     "util", "child_process", "cluster", "net", "tls", "dgram", "dns", "zlib",
@@ -1430,12 +1436,14 @@ class ArchitectureScanner:
                 name = sym.name
                 if name in seen_names or name.startswith("Fake") or name.endswith("Error"):
                     continue
+                real_constructed = [c for c in sym.constructed if c not in BUILTIN_CLASSES]
+                real_returns = [r for r in sym.return_news if r not in BUILTIN_CLASSES]
                 is_component = (
                     sym.kind == "class"
                     or bool(self.uses_for(rel, name))
-                    or bool(sym.constructed)
-                    or bool(sym.return_news)
-                    or any(r.scope == name for r in mod.routes)
+                    or bool(real_constructed)
+                    or bool(real_returns)
+                    or name in ("App", "createBridgeServer", "create_app")
                 )
                 if not is_component:
                     continue
@@ -1454,6 +1462,8 @@ class ArchitectureScanner:
                 score += 30
             if any(u["function"] == c["name"] for u in self.import_uses):
                 score += 25
+            if c["name"].startswith("create") or c["name"].endswith("Server"):
+                score += 20
             ranked.append((score, c["name"], c))
         ranked.sort(key=lambda x: (-x[0], x[1]))
         return [c for _, _, c in ranked[:16]]
@@ -1890,17 +1900,32 @@ class ArchitectureScanner:
             "Factory functions, constructors, and dependency injection wiring. "
             "Shows how service instances and client connections are assembled during startup.\n",
             "```mermaid",
-            "flowchart LR",
+            "flowchart TB",
         ]
+        routes = self.all_routes()
+        route_scopes = {r.scope for r in routes if r.scope}
+        by_name = {c["name"]: c for cs in components_by_rt.values() for c in cs}
+
+        # Filter out route handler scopes from Control Plane diagram
         for rid, rt in sorted(runtimes.items()):
             title = self._runtime_title(rt)
             md.append(f'    subgraph {mermaid_id("CP", rid)}["{mermaid_label(title)} Control Plane"]')
-            for c in components_by_rt.get(rid, []):
-                md.append(f'        {c["id"]}["{mermaid_label(c["name"])}"]')
+            comps = [c for c in components_by_rt.get(rid, []) if c["name"] not in route_scopes]
+            for c in comps:
+                md.append(f'        {c["id"]}["{mermaid_label(c["name"])}()"]')
             md.append("    end")
 
+        # Render edges only between non-route factory/instance components
+        rendered_edges = set()
         for src, dst, label in edges:
-            md.append(f"    {src} -->|{mermaid_edge_label(label)}| {dst}")
+            src_name = next((c["name"] for c in by_name.values() if c["id"] == src), None)
+            dst_name = next((c["name"] for c in by_name.values() if c["id"] == dst), None)
+            if src_name in route_scopes or dst_name in route_scopes:
+                continue
+            edge_key = (src, dst)
+            if edge_key not in rendered_edges:
+                rendered_edges.add(edge_key)
+                md.append(f"    {src} -->|{mermaid_edge_label(label)}| {dst}")
         md.append("```\n")
         md.append("---\n")
         return md
@@ -1913,42 +1938,79 @@ class ArchitectureScanner:
             "```mermaid",
             "flowchart LR",
         ]
-        for rid, rt in sorted(runtimes.items()):
-            title = self._runtime_title(rt)
-            md.append(f'    subgraph {mermaid_id("DP", rid)}["{mermaid_label(title)} Runtime"]')
-            for c in components_by_rt.get(rid, []):
+
+        routes = self.all_routes()
+        route_scopes = {r.scope for r in routes if r.scope}
+        by_name = {c["name"]: c for cs in components_by_rt.values() for c in cs}
+
+        # Collect active data-plane components
+        active_names = set(route_scopes)
+        for src, dst, var in data_flow_edges:
+            active_names.add(src)
+            active_names.add(dst)
+        for u in self.import_uses:
+            if by_name.get(u["function"]) and by_name[u["function"]]["kind"] == "class":
+                active_names.add(u["function"])
+        for c in by_name.values():
+            if c["kind"] == "class" or c["name"] in ("App", "SessionStore", "OmpRpcTransport", "PushNotificationRegistry", "OmpSessionIndex"):
+                active_names.add(c["name"])
+
+        # 1. Ingress subgraph (Handler / Route entrypoint)
+        ingress_comps = [by_name[name] for name in sorted(active_names) if name in by_name and (name in route_scopes or name in ("App", "createBridgeServer"))]
+        if ingress_comps:
+            md.append('    subgraph Ingress["Request Ingress"]')
+            for c in ingress_comps:
+                md.append(f'        {c["id"]}["{mermaid_label(c["name"])}()"]')
+            md.append("    end")
+
+        # 2. Pipeline subgraph (Active runtime components & stores)
+        pipeline_comps = [
+            by_name[name] for name in sorted(active_names)
+            if name in by_name
+            and name not in route_scopes
+            and name not in ("App", "createBridgeServer")
+            and not (name.startswith("create_") and name.replace("create_", "") in [x.lower() for x in active_names])
+        ]
+        if pipeline_comps:
+            md.append('    subgraph Pipeline["Data Processing & Storage Pipeline"]')
+            for c in pipeline_comps:
                 md.append(f'        {c["id"]}["{mermaid_label(c["name"])}"]')
             md.append("    end")
 
-        shown_ext = [ext for ext in externals if ext["kind"] != "import" or any(u["package"] == ext["name"] for u in self.import_uses)]
-        if shown_ext:
-            md.append('    subgraph DP_Externals["External Dependencies & Services"]')
-            for ext in shown_ext:
+        # 3. External Services subgraph
+        active_ext_names = {u["package"] for u in self.import_uses if u["function"] in active_names}
+        active_ext = [ext for ext in externals if ext["name"] in active_ext_names or ext["kind"] in ("process", "http")]
+        if active_ext:
+            md.append('    subgraph ExternalServices["External Dependencies & Services"]')
+            for ext in active_ext:
                 md.append(f'        {ext["id"]}(["{mermaid_label(ext["name"])}"])')
             md.append("    end")
 
-        by_name = {c["name"]: c for cs in components_by_rt.values() for c in cs}
-        pkg_ids = {ext["name"]: ext["id"] for ext in shown_ext}
+        # Draw ingress to pipeline edges
+        for ing in ingress_comps:
+            for p in pipeline_comps:
+                mod = self.modules.get(ing["file"])
+                if mod and (p["name"] in mod.text or p["name"].lower() in mod.text):
+                    md.append(f"    {ing['id']} -->|calls| {p['id']}")
 
+        # Draw AST direct data flow edges
         for src_name, dst_name, var_name in data_flow_edges:
             src_c = by_name.get(src_name)
             dst_c = by_name.get(dst_name)
             if src_c and dst_c:
                 md.append(f"    {src_c['id']} -->|{mermaid_edge_label(var_name)}| {dst_c['id']}")
 
+        # Draw component to external SDK edges
+        pkg_ids = {ext["name"]: ext["id"] for ext in active_ext}
+        rendered_sdk_edges = set()
         for u in self.import_uses:
             src = by_name.get(u["function"])
             dst = pkg_ids.get(u["package"])
-            if src and dst:
-                md.append(f"    {src['id']} -->|{mermaid_edge_label(u['binding'])}| {dst}")
-
-        kind_label = {"http": "HTTPS", "process": "stdio", "disk": "fs"}
-        for ext in shown_ext:
-            if ext["kind"] == "import":
-                continue
-            owner = self._owner_component(set(ext.get("files") or ()), components_by_rt, runtimes)
-            if owner:
-                md.append(f"    {owner['id']} -.->|{mermaid_edge_label(kind_label.get(ext['kind'], ext['kind']))}| {ext['id']}")
+            if src and dst and src["name"] in active_names:
+                edge_key = (src["id"], dst)
+                if edge_key not in rendered_sdk_edges:
+                    rendered_sdk_edges.add(edge_key)
+                    md.append(f"    {src['id']} -->|{mermaid_edge_label(u['binding'])}| {dst}")
 
         md.append("```\n")
         if self.import_uses:
@@ -1967,7 +2029,6 @@ class ArchitectureScanner:
             md.append("")
         md.append("---\n")
         return md
-
     def _render_level3(self, route: Optional[Route], runtimes) -> List[str]:
         md = ["## Level 3 — Request execution flow\n"]
         if not route:

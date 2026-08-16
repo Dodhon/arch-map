@@ -70,46 +70,37 @@ flowchart TB
 Factory functions, constructors, and dependency injection wiring. Shows how service instances and client connections are assembled during startup.
 
 ```mermaid
-flowchart LR
+flowchart TB
     subgraph CP_bridge["HTTP bridge Control Plane"]
-        C_OmpRpcTransport["OmpRpcTransport"]
-        C_OmpSessionIndex["OmpSessionIndex"]
-        C_PushNotificationRegistry["PushNotificationRegistry"]
-        C_SessionStore["SessionStore"]
-        C_activityLines["activityLines"]
-        C_assertSafeConfiguredDirectory["assertSafeConfiguredDirectory"]
-        C_assistantMessageCreatedAt["assistantMessageCreatedAt"]
-        C_basename["basename"]
-        C_buildHealthPayload["buildHealthPayload"]
-        C_checkInternetConnectivity["checkInternetConnectivity"]
-        C_createBridgeServer["createBridgeServer"]
-        C_createCodexAccountReader["createCodexAccountReader"]
-        C_createImageAttachmentStore["createImageAttachmentStore"]
-        C_createProtocol["createProtocol"]
-        C_currentLocationPayload["currentLocationPayload"]
-        C_dedupeSessions["dedupeSessions"]
+        C_OmpRpcTransport["OmpRpcTransport()"]
+        C_OmpSessionIndex["OmpSessionIndex()"]
+        C_PushNotificationRegistry["PushNotificationRegistry()"]
+        C_SessionStore["SessionStore()"]
+        C_createBridgeServer["createBridgeServer()"]
+        C_checkInternetConnectivity["checkInternetConnectivity()"]
+        C_defaultSessionIndex["defaultSessionIndex()"]
+        C_defaultTransportFactory["defaultTransportFactory()"]
+        C_start["start()"]
     end
     subgraph CP_client["Client app Control Plane"]
-        C_App["App"]
-        C_enablePushNotifications["enablePushNotifications"]
-        C_persistConversationCache["persistConversationCache"]
-        C_pickImageFromLibrary["pickImageFromLibrary"]
-        C_selectSession["selectSession"]
-        C_send["send"]
-        C_startNewChat["startNewChat"]
-        C_syncActiveSession["syncActiveSession"]
-        C_takePicture["takePicture"]
-        C_activityDisplayLines["activityDisplayLines"]
-        C_aggregateDimensionRows["aggregateDimensionRows"]
-        C_buildDateRange["buildDateRange"]
-        C_canSendMessage["canSendMessage"]
-        C_cleanupRemovedFeatureData["cleanupRemovedFeatureData"]
-        C_clearCachedActiveSession["clearCachedActiveSession"]
-        C_createConversationRequestOwnership["createConversationRequestOwnership"]
+        C_App["App()"]
+        C_enablePushNotifications["enablePushNotifications()"]
+        C_persistConversationCache["persistConversationCache()"]
+        C_pickImageFromLibrary["pickImageFromLibrary()"]
+        C_selectSession["selectSession()"]
+        C_send["send()"]
+        C_startNewChat["startNewChat()"]
+        C_syncActiveSession["syncActiveSession()"]
+        C_takePicture["takePicture()"]
+        C_createOmpPhoneApi["createOmpPhoneApi()"]
+        C_request["request()"]
     end
     C_createBridgeServer -->|owns| C_SessionStore
     C_createBridgeServer -->|owns| C_PushNotificationRegistry
-    C_createCodexAccountReader -->|owns| C_createProtocol
+    C_defaultSessionIndex -->|owns| C_OmpSessionIndex
+    C_defaultTransportFactory -->|owns| C_OmpRpcTransport
+    C_App -->|uses| C_createOmpPhoneApi
+    C_createOmpPhoneApi -->|HTTP| C_createBridgeServer
 ```
 
 ---
@@ -120,43 +111,16 @@ Runtime data-flow topology. Shows how client components pass intermediate data (
 
 ```mermaid
 flowchart LR
-    subgraph DP_bridge["HTTP bridge Runtime"]
+    subgraph Ingress["Request Ingress"]
+        C_App["App()"]
+    end
+    subgraph Pipeline["Data Processing & Storage Pipeline"]
         C_OmpRpcTransport["OmpRpcTransport"]
         C_OmpSessionIndex["OmpSessionIndex"]
         C_PushNotificationRegistry["PushNotificationRegistry"]
         C_SessionStore["SessionStore"]
-        C_activityLines["activityLines"]
-        C_assertSafeConfiguredDirectory["assertSafeConfiguredDirectory"]
-        C_assistantMessageCreatedAt["assistantMessageCreatedAt"]
-        C_basename["basename"]
-        C_buildHealthPayload["buildHealthPayload"]
-        C_checkInternetConnectivity["checkInternetConnectivity"]
-        C_createBridgeServer["createBridgeServer"]
-        C_createCodexAccountReader["createCodexAccountReader"]
-        C_createImageAttachmentStore["createImageAttachmentStore"]
-        C_createProtocol["createProtocol"]
-        C_currentLocationPayload["currentLocationPayload"]
-        C_dedupeSessions["dedupeSessions"]
     end
-    subgraph DP_client["Client app Runtime"]
-        C_App["App"]
-        C_enablePushNotifications["enablePushNotifications"]
-        C_persistConversationCache["persistConversationCache"]
-        C_pickImageFromLibrary["pickImageFromLibrary"]
-        C_selectSession["selectSession"]
-        C_send["send"]
-        C_startNewChat["startNewChat"]
-        C_syncActiveSession["syncActiveSession"]
-        C_takePicture["takePicture"]
-        C_activityDisplayLines["activityDisplayLines"]
-        C_aggregateDimensionRows["aggregateDimensionRows"]
-        C_buildDateRange["buildDateRange"]
-        C_canSendMessage["canSendMessage"]
-        C_cleanupRemovedFeatureData["cleanupRemovedFeatureData"]
-        C_clearCachedActiveSession["clearCachedActiveSession"]
-        C_createConversationRequestOwnership["createConversationRequestOwnership"]
-    end
-    subgraph DP_Externals["External Dependencies & Services"]
+    subgraph ExternalServices["External Dependencies & Services"]
         X_react_native_async_storage_async_storage(["@react-native-async-storage/async-storage"])
         X_expo_file_system_legacy(["expo-file-system/legacy"])
         X_expo_image_picker(["expo-image-picker"])
@@ -164,7 +128,6 @@ flowchart LR
         X_expo_status_bar(["expo-status-bar"])
         X_react(["react"])
         X_react_native(["react-native"])
-        X_Local_disk_files(["Local disk files"])
         X_exp_host(["exp.host"])
         X_www_gstatic_com(["www.gstatic.com"])
     end
@@ -175,18 +138,6 @@ flowchart LR
     C_App -->|FileSystem| X_expo_file_system_legacy
     C_App -->|SecureStore| X_expo_secure_store
     C_App -->|AsyncStorage| X_react_native_async_storage_async_storage
-    C_syncActiveSession -->|AppState| X_react_native
-    C_persistConversationCache -->|AsyncStorage| X_react_native_async_storage_async_storage
-    C_pickImageFromLibrary -->|ImagePicker| X_expo_image_picker
-    C_takePicture -->|ImagePicker| X_expo_image_picker
-    C_enablePushNotifications -->|AsyncStorage| X_react_native_async_storage_async_storage
-    C_send -->|Image| X_react_native
-    C_selectSession -->|AsyncStorage| X_react_native_async_storage_async_storage
-    C_startNewChat -->|Keyboard| X_react_native
-    C_startNewChat -->|AsyncStorage| X_react_native_async_storage_async_storage
-    C_OmpSessionIndex -.->|fs| X_Local_disk_files
-    C_PushNotificationRegistry -.->|HTTPS| X_exp_host
-    C_buildHealthPayload -.->|HTTPS| X_www_gstatic_com
 ```
 
 Function → import bindings:
