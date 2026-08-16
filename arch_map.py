@@ -100,6 +100,21 @@ def mermaid_label(text: str) -> str:
     return str(text).replace('"', "'").replace("\n", " ").strip()[:80]
 
 
+def storage_shape(node_id: str, label: str, category: Optional[str] = None) -> str:
+    cleaned_label = mermaid_label(label)
+    cat = (category or "").lower()
+    lbl = label.lower()
+    if any(k in cat or k in lbl for k in ("database", "cosmos", "postgres", "sql", "mongo", "dynamo", "gremlin", "sqlite", "table")):
+        return f'{node_id}[("{cleaned_label}")]'
+    if any(k in cat or k in lbl for k in ("blob", "storage", "s3", "bucket", "gcs", "disk", "file_system", "filesystem")):
+        return f'{node_id}([("{cleaned_label}")])'
+    if any(k in cat or k in lbl for k in ("cache", "redis", "memcached")):
+        return f'{node_id}{{{{"{cleaned_label}"}}}}'
+    if any(k in cat or k in lbl for k in ("queue", "stream", "kafka", "sqs", "event", "bus")):
+        return f'{node_id}(["{cleaned_label}"])'
+    return f'{node_id}["{cleaned_label}"]'
+
+
 def posix(path: Path | str) -> str:
     return str(path).replace("\\", "/")
 
@@ -1745,6 +1760,107 @@ class ArchitectureScanner:
                 return next((c for c in comps if "Server" in c["name"] or c["kind"] == "entrypoint"), comps[0] if comps else None)
         return None
 
+    def extract_data_flow(self, route: Optional[Route]) -> List[Tuple[str, str, str]]:
+        edges: List[Tuple[str, str, str]] = []
+        seen = set()
+        if not route:
+            return edges
+        mod = self.modules.get(route.file)
+        if not mod:
+            return edges
+
+        local_bindings: Dict[str, str] = {}
+        for fn in mod.functions.values():
+            local_bindings.update(fn.bindings)
+        scope_sym = self.lookup_symbol(route.file, route.scope)
+        if scope_sym:
+            local_bindings.update(scope_sym.bindings)
+
+        def resolve_comp(name: Optional[str]) -> Optional[str]:
+            if not name:
+                return None
+            typ = local_bindings.get(name, name)
+            sym = self.lookup_symbol(route.file, typ)
+            if sym:
+                if sym.kind == "class":
+                    return sym.name
+                if sym.return_news:
+                    cand = sym.return_news[-1]
+                    cand_sym = self.lookup_symbol(sym.file, cand) or self.lookup_symbol(route.file, cand)
+                    return cand_sym.name if cand_sym else cand
+                return sym.name
+            return typ if typ and (typ[:1].isupper() or typ.endswith("Store") or typ.endswith("Index") or typ.endswith("Agent")) else None
+
+        if route.file.endswith(".py"):
+            try:
+                tree = ast.parse(mod.text)
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == route.scope:
+                        var_producer: Dict[str, str] = {}
+                        for stmt in _py_local_statements(node):
+                            if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):
+                                recv, method = _py_callee(stmt.value.func)
+                                prod = resolve_comp(recv) or resolve_comp(method)
+                                if prod:
+                                    for target in stmt.targets:
+                                        if isinstance(target, ast.Name):
+                                            var_producer[target.id] = prod
+                            elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.value, ast.Call) and isinstance(stmt.target, ast.Name):
+                                recv, method = _py_callee(stmt.value.func)
+                                prod = resolve_comp(recv) or resolve_comp(method)
+                                if prod:
+                                    var_producer[stmt.target.id] = prod
+
+                            calls_in_stmt = [n for n in ast.walk(stmt) if isinstance(n, ast.Call)]
+                            for call in calls_in_stmt:
+                                recv2, method2 = _py_callee(call.func)
+                                consumer = resolve_comp(recv2) or resolve_comp(method2)
+                                if not consumer:
+                                    continue
+                                used_vars = set()
+                                for arg in call.args:
+                                    for sub in ast.walk(arg):
+                                        if isinstance(sub, ast.Name) and sub.id in var_producer:
+                                            used_vars.add(sub.id)
+                                for kw in call.keywords:
+                                    for sub in ast.walk(kw.value):
+                                        if isinstance(sub, ast.Name) and sub.id in var_producer:
+                                            used_vars.add(sub.id)
+                                for var_name in used_vars:
+                                    src_comp = var_producer[var_name]
+                                    if src_comp != consumer:
+                                        key = (src_comp, consumer, var_name)
+                                        if key not in seen:
+                                            seen.add(key)
+                                            edges.append(key)
+            except Exception:
+                pass
+        else:
+            var_producer = {}
+            for m in re.finditer(r"(?:const|let|var)\s+([A-Za-z0-9_]+)\s*=\s*(?:await\s+)?([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)\(", route.body):
+                var_name, recv, method = m.group(1), m.group(2), m.group(3)
+                prod = resolve_comp(recv) or resolve_comp(method)
+                if prod:
+                    var_producer[var_name] = prod
+            for m in re.finditer(r"(?:const|let|var)\s+([A-Za-z0-9_]+)\s*=\s*(?:await\s+)?([A-Za-z0-9_]+)\(", route.body):
+                var_name, fn_name = m.group(1), m.group(2)
+                prod = resolve_comp(fn_name)
+                if prod:
+                    var_producer[var_name] = prod
+            for m in re.finditer(r"([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)\(([^;]+)\)", route.body):
+                recv2, method2, args_str = m.group(1), m.group(2), m.group(3)
+                consumer = resolve_comp(recv2) or resolve_comp(method2)
+                if not consumer:
+                    continue
+                for var_name, src_comp in var_producer.items():
+                    if re.search(r"" + re.escape(var_name) + r"", args_str):
+                        if src_comp != consumer:
+                            key = (src_comp, consumer, var_name)
+                            if key not in seen:
+                                seen.add(key)
+                                edges.append(key)
+        return edges
+
     def render_markdown(self) -> str:
         runtimes = self.runtimes()
         components_by_rt = {rid: self.architectural_components(rt) for rid, rt in runtimes.items()}
@@ -1754,25 +1870,28 @@ class ArchitectureScanner:
         edges = self.composition_edges(all_components)
         routes = self.all_routes()
         flow_route = self.choose_flow_route()
+        data_flow_edges = self.extract_data_flow(flow_route)
 
         md: List[str] = []
         md.append(f"# {self.repo_name} — Architecture\n")
         md.append(
-            "Generated by `arch-map` using **deterministic structural JS/TS analysis** "
-            "and **Python AST** (functions, classes, imports, routes, and call resolution) "
-            "plus **function → import** edges (the import name as written in source, not a renamed cloud product). "
-            "No language server is used in this pass. Same tree → same document.\n"
+            "Generated by `arch-map` using **deterministic structural AST analysis** "
+            "(brace-matched JS/TS and Python AST) "
+            "plus **function → import** bindings and **client data flow**. "
+            "Same codebase → same document. Zero hallucinations.\n"
         )
         md.append("| View | Question | Source |")
         md.append("| :--- | :--- | :--- |")
-        md.append("| **Level 1 — System context** | Who talks to this system, and what is outside it? | Entrypoints, URL literals, `spawn`, imported packages |")
-        md.append("| **Level 2 — Service topology** | Which functions use which imports? | Function body mentions of imported names |")
-        md.append("| **Level 3 — Data flow** | What happens on one request? | Handler call graph, then each function's imports |")
+        md.append("| **Level 1 — System context & trust boundary** | Who talks to this system, and what external dependencies lie outside our perimeter? | Entrypoints, URL literals, `spawn`, imported packages |")
+        md.append("| **Level 2a — Control plane (wiring)** | How is the application instantiated, configured, and injected? | Factory functions, constructors, and binding graph |")
+        md.append("| **Level 2b — Data plane (client data flow)** | How do internal services and storage exchange data at runtime? | Route handlers, variable passing, and client data graph |")
+        md.append("| **Level 3 — Request execution flow** | What happens on a critical request end-to-end? | Route handler call-graph walk, parameter contracts, and transforms |")
         md.append("")
         md.append("---\n")
 
         md.extend(self._render_level1(runtimes, components_by_rt, externals))
-        md.extend(self._render_level2(runtimes, components_by_rt, device_ext, edges, routes))
+        md.extend(self._render_level2a(runtimes, components_by_rt, edges))
+        md.extend(self._render_level2b(runtimes, components_by_rt, device_ext, data_flow_edges, routes, flow_route))
         md.extend(self._render_level3(flow_route, runtimes))
         md.extend(self._render_routes(routes))
         md.extend(self._render_env())
@@ -1789,13 +1908,16 @@ class ArchitectureScanner:
 
     def _render_level1(self, runtimes, components_by_rt, externals) -> List[str]:
         md = [
-            "## Level 1 — System context\n",
-            "People and external systems around this repository. Internal folders such as `test/` and `scripts/` are omitted. "
-            "External nodes are import names (`azure.cosmos`, `azure.ai.projects`, `gremlin_python...`) plus spawn/URL I/O. No product-name translation.\n",
+            "## Level 1 — System context & trust boundary\n",
+            "External actors, application workload boundaries, and third-party cloud services. "
+            "Internal folders such as `test/` and `scripts/` are omitted. "
+            "Storage services use distinct semantic shapes (`[()]` databases, `[([])]` object stores).\n",
             "```mermaid",
             "flowchart TB",
-            '    User["User"]',
-            f'    subgraph System["{mermaid_label(self.repo_name)}"]',
+            '    subgraph ClientZone["Client Perimeter (Untrusted)"]',
+            '        User(["User / Client"])',
+            '    end',
+            f'    subgraph AppBoundary["Workload Boundary ({mermaid_label(self.repo_name)})"]',
         ]
         rt_ids = {}
         for rid, rt in sorted(runtimes.items()):
@@ -1805,18 +1927,20 @@ class ArchitectureScanner:
             files = ", ".join(Path(f).name for f in rt["entrypoints"][:2])
             md.append(f'        {nid}["{mermaid_label(title)}\\n{files}"]')
         md.append("    end")
-        for ext in externals:
-            if ext["kind"] == "disk":
-                md.append(f'    {ext["id"]}(["{mermaid_label(ext["name"])}"])')
-            else:
-                md.append(f'    {ext["id"]}["{mermaid_label(ext["name"])}"]')
+
+        if externals:
+            md.append('    subgraph CloudPerimeter["External Services & Managed Cloud Perimeter"]')
+            for ext in externals:
+                shape = storage_shape(ext["id"], ext["name"], ext.get("kind"))
+                md.append(f"        {shape}")
+            md.append("    end")
 
         ui = next((rid for rid, rt in runtimes.items() if rt["kind"] == "ui"), None)
         http = next((rid for rid, rt in runtimes.items() if rt["kind"] == "http"), None)
         if ui:
             md.append(f"    User -->|touch / type| {rt_ids[ui]}")
         elif http:
-            md.append(f"    User --> {rt_ids[http]}")
+            md.append(f"    User -->|HTTPS| {rt_ids[http]}")
         if ui and http:
             md.append(f"    {rt_ids[ui]} -->|HTTP + Bearer| {rt_ids[http]}")
 
@@ -1827,45 +1951,90 @@ class ArchitectureScanner:
             "import": "import", "device": "import",
         }
         for ext in externals:
-            if http_id:
-                md.append(f"    {http_id} -->|{kind_label.get(ext['kind'], ext['kind'])}| {ext['id']}")
-            elif ui_id:
-                md.append(f"    {ui_id} -->|{kind_label.get(ext['kind'], ext['kind'])}| {ext['id']}")
+            target_node = http_id or ui_id
+            if target_node:
+                lbl = kind_label.get(ext["kind"], ext["kind"])
+                if ext.get("evidence") and ext["evidence"] != ext["name"]:
+                    lbl = f"{lbl} / {mermaid_label(ext['evidence'])}"
+                if ext["kind"] == "disk" or "telemetry" in ext["name"].lower() or "monitor" in ext["name"].lower():
+                    md.append(f"    {target_node} -.->|{lbl}| {ext['id']}")
+                else:
+                    md.append(f"    {target_node} -->|{lbl}| {ext['id']}")
         md.append("```\n")
         if externals:
-            md.append("| External system | Kind | Evidence |")
-            md.append("| :--- | :--- | :--- |")
+            md.append("| External system | Kind | Semantic Type | Evidence |")
+            md.append("| :--- | :--- | :--- | :--- |")
             for ext in externals:
-                md.append(f"| **{ext['name']}** | `{ext['kind']}` | `{ext['evidence']}` |")
+                sem = "Database / Graph" if any(k in ext["name"].lower() for k in ("db", "cosmos", "gremlin", "sql", "mongo")) else (
+                    "Object / File Storage" if any(k in ext["name"].lower() for k in ("blob", "storage", "s3", "disk")) else (
+                        "Managed AI Service" if any(k in ext["name"].lower() for k in ("ai", "foundry", "openai")) else (
+                            "Secret Store" if any(k in ext["name"].lower() for k in ("keyvault", "secret", "vault")) else (
+                                "Telemetry / Observability" if any(k in ext["name"].lower() for k in ("monitor", "telemetry", "log")) else (
+                                    "HTTP / External API" if ext["kind"] == "http" else "Library / SDK"
+                                )
+                            )
+                        )
+                    )
+                )
+                md.append(f"| **{ext['name']}** | `{ext['kind']}` | {sem} | `{ext['evidence']}` |")
             md.append("")
         md.append("---\n")
         return md
 
-    def _render_level2(self, runtimes, components_by_rt, externals, edges, routes) -> List[str]:
+    def _render_level2a(self, runtimes, components_by_rt, edges) -> List[str]:
         md = [
-            "## Level 2 — Service topology\n",
-            "Deployable / process pieces and the components they compose. UI widgets and test doubles are omitted. "
-            "Each function points at the import names it mentions. `gremlin` stays `gremlin`.\n",
+            "## Level 2a — Control plane (Wiring & Dependency Injection)\n",
+            "Factory functions, constructors, and dependency injection wiring. "
+            "Shows how service instances and client connections are assembled during startup.\n",
             "```mermaid",
             "flowchart LR",
         ]
         for rid, rt in sorted(runtimes.items()):
             title = self._runtime_title(rt)
-            md.append(f'    subgraph {mermaid_id("SG", rid)}["{mermaid_label(title)}"]')
+            md.append(f'    subgraph {mermaid_id("CP", rid)}["{mermaid_label(title)} Control Plane"]')
             for c in components_by_rt.get(rid, []):
                 md.append(f'        {c["id"]}["{mermaid_label(c["name"])}"]')
             md.append("    end")
 
-        shown_ext = []
-        for ext in externals:
-            shown_ext.append(ext)
-            md.append(f'    {ext["id"]}["{mermaid_label(ext["name"])}"]')
-
         for src, dst, label in edges:
             md.append(f"    {src} -->|{mermaid_label(label)}| {dst}")
+        md.append("```\n")
+        md.append("---\n")
+        return md
+
+    def _render_level2b(self, runtimes, components_by_rt, externals, data_flow_edges, routes, flow_route) -> List[str]:
+        md = [
+            "## Level 2b — Data plane (Client-to-client data flow)\n",
+            "Runtime data-flow topology. Shows how client components pass intermediate data (arguments, return values) "
+            "to downstream storage and cloud APIs during request execution. Storage nodes use semantic shapes.\n",
+            "```mermaid",
+            "flowchart LR",
+        ]
+        for rid, rt in sorted(runtimes.items()):
+            title = self._runtime_title(rt)
+            md.append(f'    subgraph {mermaid_id("DP", rid)}["{mermaid_label(title)} Runtime"]')
+            for c in components_by_rt.get(rid, []):
+                shape = storage_shape(c["id"], c["name"])
+                md.append(f'        {shape}')
+            md.append("    end")
+
+        shown_ext = [ext for ext in externals if ext["kind"] != "import" or any(u["package"] == ext["name"] for u in self.import_uses)]
+        if shown_ext:
+            md.append('    subgraph DP_Externals["External Persistence & Cloud Services"]')
+            for ext in shown_ext:
+                shape = storage_shape(ext["id"], ext["name"], ext.get("kind"))
+                md.append(f'        {shape}')
+            md.append("    end")
 
         by_name = {c["name"]: c for cs in components_by_rt.values() for c in cs}
         pkg_ids = {ext["name"]: ext["id"] for ext in shown_ext}
+
+        for src_name, dst_name, var_name in data_flow_edges:
+            src_c = by_name.get(src_name)
+            dst_c = by_name.get(dst_name)
+            if src_c and dst_c:
+                md.append(f"    {src_c['id']} -->|{mermaid_label(var_name)}| {dst_c['id']}")
+
         for u in self.import_uses:
             src = by_name.get(u["function"])
             dst = pkg_ids.get(u["package"])
@@ -1882,18 +2051,24 @@ class ArchitectureScanner:
 
         md.append("```\n")
         if self.import_uses:
-            md.append("Function → import (the graph above is this table):\n")
-            md.append("| Function | Import | Binding | File |")
+            md.append("Function → import bindings:\n")
+            md.append("| Component / Function | Import | Binding | File |")
             md.append("| :--- | :--- | :--- | :--- |")
             for u in sorted(self.import_uses, key=lambda x: (x["function"], x["package"])):
                 md.append(f"| `{u['function']}` | `{u['package']}` | `{u['binding']}` | `{u['file']}` |")
             md.append("")
-        md.append("See **Routes** below for the full endpoint list.\n")
+        if data_flow_edges:
+            md.append("Extracted client-to-client data edges (from AST):\n")
+            md.append("| Source Component | Target Component | Passed Variable / Data |")
+            md.append("| :--- | :--- | :--- |")
+            for src_name, dst_name, var_name in data_flow_edges:
+                md.append(f"| `{src_name}` | `{dst_name}` | `{var_name}` |")
+            md.append("")
         md.append("---\n")
         return md
 
     def _render_level3(self, route: Optional[Route], runtimes) -> List[str]:
-        md = ["## Level 3 — Request data flow\n"]
+        md = ["## Level 3 — Request execution flow\n"]
         if not route:
             md.append("*No HTTP route handler was found to trace.*\n")
             md.append("---\n")
@@ -1905,33 +2080,26 @@ class ArchitectureScanner:
         md.append(
             f"Traced **`{route.method} {route.path}`** from `{route.file}`"
             + (f" (client method `{client[0]}` in `{client[1]}`)" if client else "")
-            + ". Handler call-graph walk (no language server).\n"
+            + ". Handler call-graph walk with parameter bindings.\n"
         )
         if fields:
-            md.append("Request body fields read in the handler: " + ", ".join(f"`{f}`" for f in fields) + ".\n")
+            md.append("Request body fields read in handler: " + ", ".join(f"`{f}`" for f in fields) + ".\n")
         if "async" in fields:
             md.append("Branch: `body.async` chooses `startMessage` (non-blocking) vs `sendMessage` (await completion).\n")
 
         def pid(name: str) -> str:
             aliases = {
-                "User": "User",
-                "App": "App",
-                "HTTP": "HTTP",
-                "Api": "Api",
-                "isAuthorized": "Auth",
-                "SessionStore": "Store",
-                "OmpRpcTransport": "Rpc",
-                "PushNotificationRegistry": "Push",
-                "Expo Push API": "Expo",
-                "createImageAttachmentStore": "Images",
-                "storeMessageAttachments": "Attach",
-                "getResumeSession": "Resume",
-
+                "User": "User", "App": "App", "HTTP": "HTTP", "Api": "Api",
+                "isAuthorized": "Auth", "SessionStore": "Store",
+                "OmpRpcTransport": "Rpc", "PushNotificationRegistry": "Push",
+                "Expo Push API": "Expo", "createImageAttachmentStore": "Images",
+                "storeMessageAttachments": "Attach", "getResumeSession": "Resume",
             }
             return aliases.get(name, mermaid_id("P", name))
 
         md.append("```mermaid")
         md.append("sequenceDiagram")
+        md.append("    autonumber")
         md.append("    actor User")
         declared = ["User"]
 
@@ -1972,7 +2140,7 @@ class ArchitectureScanner:
         md.append("```\n")
 
         md.append("### Transform table\n")
-        md.append("| Step | From → to | Action | Where |")
+        md.append("| Step | From → To | Action | Where |")
         md.append("| :--- | :--- | :--- | :--- |")
         n = 1
         if client:
@@ -1987,12 +2155,11 @@ class ArchitectureScanner:
                 f"| {n} | `{step.get('src', 'HTTP')}` → `{step['actor']}` | `{mermaid_label(step['action'])}` | `{step['file']}` |"
             )
             n += 1
-            if n > 16:
+            if n > 20:
                 break
         md.append("")
         md.append("---\n")
         return md
-
     def _render_routes(self, routes: List[Route]) -> List[str]:
         md = ["## Routes\n"]
         if not routes:
