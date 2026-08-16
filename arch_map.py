@@ -369,6 +369,7 @@ class Symbol:
     name: str
     kind: str
     file: str
+    lineno: int = 1
     body: str = ""
     methods: Dict[str, str] = field(default_factory=dict)
     bindings: Dict[str, str] = field(default_factory=dict)
@@ -383,6 +384,7 @@ class Route:
     file: str
     body: str
     scope: str
+    lineno: int = 1
     source: str = "server"
 
 
@@ -556,7 +558,8 @@ def parse_py_module(rel: str, text: str) -> Optional[JsModule]:
         bindings, constructed, returns = _py_assign_bindings(node)
         merged = dict(parent_bindings)
         merged.update(bindings)
-        _add_function(mod, node.name, body)
+        lineno = getattr(node, "lineno", 1)
+        _add_function(mod, node.name, body, lineno=lineno)
         sym = mod.functions[node.name]
         sym.bindings = merged
         sym.constructed = constructed
@@ -568,7 +571,7 @@ def parse_py_module(rel: str, text: str) -> Optional[JsModule]:
         route = _py_route_from_decorators(node)
         if route:
             method, path = route
-            mod.routes.append(Route(method, path, rel, body, node.name, "server"))
+            mod.routes.append(Route(method, path, rel, body, node.name, lineno=getattr(node, "lineno", 1), source="server"))
         for child in node.body:
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 add_fn(child, merged)
@@ -579,7 +582,7 @@ def parse_py_module(rel: str, text: str) -> Optional[JsModule]:
             add_fn(node, module_bindings)
         elif isinstance(node, ast.ClassDef):
             body = _py_source_segment(text, node)
-            sym = Symbol(name=node.name, kind="class", file=rel, body=body)
+            sym = Symbol(name=node.name, kind="class", file=rel, lineno=getattr(node, "lineno", 1), body=body)
             bindings, constructed, returns = _py_assign_bindings(node)
             merged = dict(module_bindings)
             merged.update(bindings)
@@ -846,7 +849,8 @@ def _extract_classes(mod: JsModule, src: JsSrc) -> None:
         if end < 0:
             continue
         body = src.s[i + 1 : end - 1]
-        sym = Symbol(name=name, kind="class", file=mod.file, body=body)
+        lineno = src.s[:m.start()].count("\n") + 1
+        sym = Symbol(name=name, kind="class", file=mod.file, lineno=lineno, body=body)
         _extract_methods(sym, body)
         sym.bindings = _const_bindings(body)
         sym.constructed = _constructed_types(body)
@@ -881,11 +885,12 @@ def _extract_functions(mod: JsModule, src: JsSrc) -> None:
         end = src.match_brace(brace_pos)
         if end < 0:
             continue
-        _add_function(mod, name, src.s[brace_pos + 1 : end - 1])
+        lineno = src.s[:m.start()].count("\n") + 1
+        _add_function(mod, name, src.s[brace_pos + 1 : end - 1], lineno=lineno)
 
 
-def _add_function(mod: JsModule, name: str, body: str) -> None:
-    sym = Symbol(name=name, kind="function", file=mod.file, body=body)
+def _add_function(mod: JsModule, name: str, body: str, lineno: int = 1) -> None:
+    sym = Symbol(name=name, kind="function", file=mod.file, lineno=lineno, body=body)
     sym.bindings = _const_bindings(body)
     sym.constructed = _constructed_types(body)
     sym.return_news = re.findall(r"\breturn\s+new\s+([A-Z][A-Za-z0-9_]*)\s*\(", body)
@@ -942,7 +947,8 @@ def _extract_routes(mod: JsModule, src: JsSrc) -> None:
     ):
         method, path = m.group(1).upper(), m.group(2)
         body = _block_after(src, m.end())
-        mod.routes.append(Route(method, path, mod.file, body, _nearest_scope(mod, m.start()), "server"))
+        lineno = src.s[:m.start()].count("\n") + 1
+        mod.routes.append(Route(method, path, mod.file, body, _nearest_scope(mod, m.start()), lineno=lineno, source="server"))
 
     for m in re.finditer(
         r"""(?:if\s*\(\s*)?method\s*===\s*['"](GET|POST|PUT|DELETE|PATCH)['"]\s*&&\s*(?:url\.pathname|pathname|path|req\.url)\s*===\s*['"]([^'"]+)['"]""",
@@ -950,7 +956,8 @@ def _extract_routes(mod: JsModule, src: JsSrc) -> None:
     ):
         method, path = m.group(1), m.group(2)
         body = _block_after(src, m.end())
-        mod.routes.append(Route(method, path, mod.file, body, _nearest_scope(mod, m.start()), "server"))
+        lineno = src.s[:m.start()].count("\n") + 1
+        mod.routes.append(Route(method, path, mod.file, body, _nearest_scope(mod, m.start()), lineno=lineno, source="server"))
 
 
 def _block_after(src: JsSrc, i: int) -> str:
@@ -1090,12 +1097,13 @@ class LspClient:
 # ---------------------------------------------------------------------------
 
 class ArchitectureScanner:
-    def __init__(self, root_path: str, use_lsp: bool = False):
+    def __init__(self, root_path: str, use_lsp: bool = False, output_path: Optional[Path] = None):
         self.root = Path(root_path).resolve()
         if not self.root.exists():
             raise FileNotFoundError(f"Target path does not exist: {self.root}")
         self.repo_name = self.root.name
         self.use_lsp = use_lsp
+        self.output_path = output_path.resolve() if output_path else None
         self.modules: Dict[str, JsModule] = {}
         self.manifest_deps: Dict[str, Set[str]] = defaultdict(set)
         self.all_manifest_deps: Set[str] = set()
@@ -1105,6 +1113,18 @@ class ArchitectureScanner:
         self.resolved_index: Dict[str, Tuple[str, str]] = {}
         self.trace_route_spec: Optional[str] = None
         self.import_uses: List[dict] = []
+
+    def source_link(self, rel_file: str, lineno: int = 1) -> str:
+        """Calculates relative link from doc file to source file with #L<lineno>."""
+        if not self.output_path:
+            return f"{rel_file}#L{lineno}"
+        try:
+            doc_dir = self.output_path.parent
+            target_abs = (self.root / rel_file).resolve()
+            rel = os.path.relpath(target_abs, doc_dir)
+            return f"{posix(rel)}#L{lineno}"
+        except Exception:
+            return f"{rel_file}#L{lineno}"
 
     def scan(self) -> None:
         self._scan_manifests()
@@ -1782,7 +1802,9 @@ class ArchitectureScanner:
                                 edges.append(key)
         return edges
 
-    def render_markdown(self) -> str:
+    def render_markdown(self, out_path: Optional[Path] = None) -> str:
+        if out_path:
+            self.output_path = out_path.resolve()
         runtimes = self.runtimes()
         components_by_rt = {rid: self.architectural_components(rt) for rid, rt in runtimes.items()}
         all_components = [c for cs in components_by_rt.values() for c in cs]
@@ -1799,7 +1821,8 @@ class ArchitectureScanner:
             "Generated by `arch-map` using **deterministic structural AST analysis** "
             "(brace-matched JS/TS and Python AST) "
             "plus **function → import** bindings and **client data flow**. "
-            "Same codebase -> same document. Zero hallucinations.\n"
+            "Same codebase -> same document. Zero hallucinations. "
+            "All components, routes, and data flows are clickable links to source code.\n"
         )
         md.append("| View | Question | Source |")
         md.append("| :--- | :--- | :--- |")
@@ -1884,12 +1907,25 @@ class ArchitectureScanner:
                 if ext.get("evidence") and ext["evidence"] != ext["name"]:
                     lbl = f"{lbl} / {ext['evidence']}"
                 md.append(f"    {target_node} -->|{mermaid_edge_label(lbl)}| {ext['id']}")
+
+        # Clickable links on entrypoints
+        for rid, rt in sorted(runtimes.items()):
+            if rt["entrypoints"]:
+                ep_file = rt["entrypoints"][0]
+                link = self.source_link(ep_file, 1)
+                md.append(f'    click {rt_ids[rid]} href "{link}" "Jump to {ep_file}"')
+
         md.append("```\n")
         if externals:
             md.append("| External system | Kind | Evidence |")
             md.append("| :--- | :--- | :--- |")
             for ext in externals:
-                md.append(f"| **{ext['name']}** | `{ext['kind']}` | `{ext['evidence']}` |")
+                evidence_text = f"`{ext['evidence']}`"
+                if ext.get("files"):
+                    first_file = sorted(ext["files"])[0]
+                    link = self.source_link(first_file, 1)
+                    evidence_text = f"[`{ext['evidence']}`]({link})"
+                md.append(f"| **{ext['name']}** | `{ext['kind']}` | {evidence_text} |")
             md.append("")
         md.append("---\n")
         return md
@@ -1898,7 +1934,8 @@ class ArchitectureScanner:
         md = [
             "## Level 2a — Control plane (Wiring & Dependency Injection)\n",
             "Factory functions, constructors, and dependency injection wiring. "
-            "Shows how service instances and client connections are assembled during startup.\n",
+            "Shows how service instances and client connections are assembled during startup. "
+            "Click any node to jump directly to its definition.\n",
             "```mermaid",
             "flowchart TB",
         ]
@@ -1907,15 +1944,16 @@ class ArchitectureScanner:
         by_name = {c["name"]: c for cs in components_by_rt.values() for c in cs}
 
         # Filter out route handler scopes from Control Plane diagram
+        rendered_comps = []
         for rid, rt in sorted(runtimes.items()):
             title = self._runtime_title(rt)
             md.append(f'    subgraph {mermaid_id("CP", rid)}["{mermaid_label(title)} Control Plane"]')
             comps = [c for c in components_by_rt.get(rid, []) if c["name"] not in route_scopes]
             for c in comps:
+                rendered_comps.append(c)
                 md.append(f'        {c["id"]}["{mermaid_label(c["name"])}()"]')
             md.append("    end")
 
-        # Render edges only between non-route factory/instance components
         rendered_edges = set()
         for src, dst, label in edges:
             src_name = next((c["name"] for c in by_name.values() if c["id"] == src), None)
@@ -1926,6 +1964,14 @@ class ArchitectureScanner:
             if edge_key not in rendered_edges:
                 rendered_edges.add(edge_key)
                 md.append(f"    {src} -->|{mermaid_edge_label(label)}| {dst}")
+
+        # Add click links for each component
+        for c in rendered_comps:
+            sym = self.lookup_symbol(c["file"], c["name"])
+            lineno = sym.lineno if sym else 1
+            link = self.source_link(c["file"], lineno)
+            md.append(f'    click {c["id"]} href "{link}" "Jump to {c["name"]} in {c["file"]}"')
+
         md.append("```\n")
         md.append("---\n")
         return md
@@ -1934,7 +1980,7 @@ class ArchitectureScanner:
         md = [
             "## Level 2b — Data plane (Client-to-client data flow)\n",
             "Runtime data-flow topology. Shows how client components pass intermediate data (arguments, return values) "
-            "to downstream storage and cloud APIs during request execution.\n",
+            "to downstream storage and cloud APIs during request execution. Click any node to jump to its source.\n",
             "```mermaid",
             "flowchart LR",
         ]
@@ -1943,7 +1989,6 @@ class ArchitectureScanner:
         route_scopes = {r.scope for r in routes if r.scope}
         by_name = {c["name"]: c for cs in components_by_rt.values() for c in cs}
 
-        # Collect active data-plane components
         active_names = set(route_scopes)
         for src, dst, var in data_flow_edges:
             active_names.add(src)
@@ -2012,23 +2057,38 @@ class ArchitectureScanner:
                     rendered_sdk_edges.add(edge_key)
                     md.append(f"    {src['id']} -->|{mermaid_edge_label(u['binding'])}| {dst}")
 
+        # Add click links for each component in Level 2b
+        for c in ingress_comps + pipeline_comps:
+            sym = self.lookup_symbol(c["file"], c["name"])
+            lineno = sym.lineno if sym else 1
+            link = self.source_link(c["file"], lineno)
+            md.append(f'    click {c["id"]} href "{link}" "Jump to {c["name"]} in {c["file"]}"')
+
         md.append("```\n")
         if self.import_uses:
             md.append("Function → import bindings:\n")
             md.append("| Component / Function | Import | Binding | File |")
             md.append("| :--- | :--- | :--- | :--- |")
             for u in sorted(self.import_uses, key=lambda x: (x["function"], x["package"])):
-                md.append(f"| `{u['function']}` | `{u['package']}` | `{u['binding']}` | `{u['file']}` |")
+                sym = self.lookup_symbol(u["file"], u["function"])
+                lineno = sym.lineno if sym else 1
+                fn_link = self.source_link(u["file"], lineno)
+                md.append(f"| [`{u['function']}`]({fn_link}) | `{u['package']}` | `{u['binding']}` | [`{u['file']}:{lineno}`]({fn_link}) |")
             md.append("")
         if data_flow_edges:
             md.append("Extracted client-to-client data edges (from AST):\n")
             md.append("| Source Component | Target Component | Passed Variable / Data |")
             md.append("| :--- | :--- | :--- |")
             for src_name, dst_name, var_name in data_flow_edges:
-                md.append(f"| `{src_name}` | `{dst_name}` | `{var_name}` |")
+                src_c = by_name.get(src_name)
+                dst_c = by_name.get(dst_name)
+                src_link = self.source_link(src_c["file"], 1) if src_c else "#"
+                dst_link = self.source_link(dst_c["file"], 1) if dst_c else "#"
+                md.append(f"| [`{src_name}`]({src_link}) | [`{dst_name}`]({dst_link}) | `{var_name}` |")
             md.append("")
         md.append("---\n")
         return md
+
     def _render_level3(self, route: Optional[Route], runtimes) -> List[str]:
         md = ["## Level 3 — Request execution flow\n"]
         if not route:
@@ -2039,9 +2099,10 @@ class ArchitectureScanner:
         steps = self.trace_route(route)
         client = self.client_for_route(route)
         fields = body_fields(route.body)
+        route_link = self.source_link(route.file, route.lineno)
         md.append(
-            f"Traced **`{route.method} {route.path}`** from `{route.file}`"
-            + (f" (client method `{client[0]}` in `{client[1]}`)" if client else "")
+            f"Traced **`{route.method} {route.path}`** from [`{route.file}:{route.lineno}`]({route_link})"
+            + (f" (client method [`{client[0]}`]({self.source_link(client[1], 1)}) in `{client[1]}`)" if client else "")
             + ". Handler call-graph walk with parameter bindings.\n"
         )
         if fields:
@@ -2106,15 +2167,20 @@ class ArchitectureScanner:
         md.append("| :--- | :--- | :--- | :--- |")
         n = 1
         if client:
+            c_link = self.source_link(client[1], 1)
             md.append(
                 f"| {n} | App → API | `{client[0]}` sends `{route.method} {route.path}`"
                 + (f" (`{', '.join(fields)}`)" if fields else "")
-                + f" | `{client[1]}` |"
+                + f" | [`{client[1]}`]({c_link}) |"
             )
             n += 1
         for step in steps:
+            loc_file = step["file"]
+            sym = self.lookup_symbol(loc_file, step["actor"])
+            loc_line = sym.lineno if sym else 1
+            loc_link = self.source_link(loc_file, loc_line)
             md.append(
-                f"| {n} | `{step.get('src', 'HTTP')}` → `{step['actor']}` | `{mermaid_label(step['action'])}` | `{step['file']}` |"
+                f"| {n} | `{step.get('src', 'HTTP')}` → `{step['actor']}` | `{mermaid_label(step['action'])}` | [`{loc_file}:{loc_line}`]({loc_link}) |"
             )
             n += 1
             if n > 20:
@@ -2132,7 +2198,8 @@ class ArchitectureScanner:
         md.append("| Method | Path | Defined in |")
         md.append("| :--- | :--- | :--- |")
         for r in routes:
-            md.append(f"| `{r.method}` | `{r.path}` | `{r.file}` |")
+            r_link = self.source_link(r.file, r.lineno)
+            md.append(f"| `{r.method}` | [`{r.path}`]({r_link}) | [`{r.file}:{r.lineno}`]({r_link}) |")
         md.append("")
         md.append("---\n")
         return md
@@ -2149,9 +2216,18 @@ class ArchitectureScanner:
         md.append("| Environment variable | Consumed in | Declared in |")
         md.append("| :--- | :--- | :--- |")
         for ev in all_env:
-            consumers = ", ".join(f"`{Path(p).name}`" for p in sorted(self.consumed_env_vars.get(ev, []))[:3]) or "*Declared only*"
-            decls = [f"`{cf}`" for cf, vdict in self.declared_env_vars.items() if ev in vdict]
-            decl = ", ".join(decls) or "*Runtime only*"
+            consumer_links = []
+            for p in sorted(self.consumed_env_vars.get(ev, []))[:3]:
+                link = self.source_link(p, 1)
+                consumer_links.append(f"[`{Path(p).name}`]({link})")
+            consumers = ", ".join(consumer_links) or "*Declared only*"
+
+            decl_links = []
+            for cf, vdict in self.declared_env_vars.items():
+                if ev in vdict:
+                    link = self.source_link(cf, 1)
+                    decl_links.append(f"[`{cf}`]({link})")
+            decl = ", ".join(decl_links) or "*Runtime only*"
             md.append(f"| `{ev}` | {consumers} | {decl} |")
         md.append("")
         return md
@@ -2207,10 +2283,16 @@ def main() -> None:
         sys.exit(1)
 
     print(f"Scanning {target_path} ...", file=sys.stderr)
-    scanner = ArchitectureScanner(str(target_path), use_lsp=args.lsp)
+    if args.output:
+        out_path = Path(args.output).resolve()
+    else:
+        docs_dir = target_path / "docs"
+        out_path = (docs_dir if docs_dir.exists() else target_path) / "architecture-mental-model.md"
+
+    scanner = ArchitectureScanner(str(target_path), use_lsp=args.lsp, output_path=out_path)
     scanner.trace_route_spec = args.route
     scanner.scan()
-    markdown_content = scanner.render_markdown()
+    markdown_content = scanner.render_markdown(out_path=out_path)
 
     if args.stdout:
         print(markdown_content)
