@@ -10,7 +10,6 @@ sys.path.insert(0, str(REPO_ROOT))
 from arch_map import (
     lint_mermaid,
     lint_markdown,
-    storage_shape,
     mermaid_edge_label,
     ArchitectureScanner,
 )
@@ -34,7 +33,7 @@ class TestMermaidLinter(unittest.TestCase):
         self.assertEqual(errors, [], f"Expected zero errors on valid flowchart, got: {errors}")
 
     def test_invalid_composite_delimiters(self):
-        # The exact bug from user's screenshots: ([("label")])
+        # Invalid composite delimiters like ([("label")]) or [([label])]
         bad_code = """flowchart TB
     X_blob([("azure.storage.blob")])
 """
@@ -70,21 +69,11 @@ class TestMermaidLinter(unittest.TestCase):
         errors = lint_mermaid(bad_subgraph)
         self.assertTrue(any("Unclosed `subgraph`" in e for e in errors))
 
-    def test_storage_shape_produces_valid_syntax(self):
-        db = storage_shape("X_db", "Cosmos DB", "database")
-        blob = storage_shape("X_blob", "Azure Blob", "storage")
-        cache = storage_shape("X_cache", "Redis", "cache")
-        plain = storage_shape("X_plain", "Regular Component")
-
-        self.assertEqual(db, 'X_db[("Cosmos DB")]')
-        self.assertEqual(blob, 'X_blob(["Azure Blob"])')
-        self.assertEqual(cache, 'X_cache{{"Redis"}}')
-        self.assertEqual(plain, 'X_plain["Regular Component"]')
-
-        # Verify all produced shapes pass the linter
-        chart = f"flowchart TB\n  {db}\n  {blob}\n  {cache}\n  {plain}\n"
-        errors = lint_mermaid(chart)
-        self.assertEqual(errors, [], f"storage_shape produced invalid Mermaid syntax: {errors}")
+    def test_mermaid_edge_label_quoting(self):
+        quoted = mermaid_edge_label("spawn / spawn(codex)")
+        self.assertEqual(quoted, '"spawn / spawn(codex)"')
+        plain = mermaid_edge_label("HTTP")
+        self.assertEqual(plain, "HTTP")
 
     def test_all_repository_markdown_files(self):
         md_files = sorted(REPO_ROOT.rglob("*.md"))

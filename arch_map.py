@@ -2,14 +2,15 @@
 """
 arch-map: Deterministic architecture scanner.
 
-Produces three views from source structure (brace-matched JS/TS analysis
-and Python stdlib AST):
-  1. System context
-  2. Service / container topology
-  3. Request data flow for one route
+Produces clean, multi-level architectural views from source code AST:
+  1. System Context & External Dependencies (who calls the system, what external SDKs/APIs the system calls)
+  2. Service Topology (Control Plane wiring + Data Plane data-flow graph)
+  3. Request Execution Flow (Step-by-step handler call-graph walk)
+  4. Endpoint Registry (All discovered HTTP/RPC routes)
+  5. Environment Matrix (Exact variables consumed and declared)
 
-No language server is used in the default pass. Same repo + same analyzer
-version yields the same Markdown.
+Pure deterministic AST analysis by default; opt-in LSP for semantic cross-file reference resolution.
+Zero hardcoding. Zero synthetic guessing. Same codebase -> same document.
 """
 
 from __future__ import annotations
@@ -19,11 +20,12 @@ import ast
 import json
 import os
 import re
+import subprocess
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 IGNORE_DIRS = {
@@ -52,40 +54,8 @@ BUILTIN_MODULES = {
     "decimal", "string", "textwrap", "pprint", "weakref", "html", "email",
 }
 
-UI_PACKAGES = {
-    "react", "react-native", "react-dom", "markdown-it", "expo-status-bar",
-    "react-native-markdown-display", "@expo/vector-icons", "expo",
-}
-
-DEVICE_IO_PACKAGES = {
-    "expo-notifications", "expo-location", "expo-image-picker", "expo-file-system",
-    "expo-secure-store", "expo-constants", "expo-device", "expo-application",
-    "@react-native-async-storage/async-storage",
-}
-
-SKIP_CALL_NAMES = {
-    "if", "for", "while", "switch", "catch", "function", "return", "typeof",
-    "void", "await", "new", "delete", "throw", "console", "Promise", "Date",
-    "Error", "JSON", "Object", "Array", "Math", "Number", "String", "Boolean",
-    "Buffer", "Set", "Map", "WeakMap", "WeakSet", "Symbol", "URL", "URLSearchParams",
-    "RegExp", "parseInt", "parseFloat", "isNaN", "isFinite", "encodeURIComponent",
-    "decodeURIComponent", "setTimeout", "setInterval", "clearTimeout", "clearInterval",
-    "require", "import", "super",
-}
-
-UTIL_NAME_RE = re.compile(
-    r"^(create)?(Logger|Id|Hash)?$|^nowIso$|^log$|^devWarn$|^styles$|^theme$",
-    re.I,
-)
-
 HTTP_METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS")
 
-AZURE_CORE_PACKAGES = {
-    "@azure/core", "@azure/core-rest-pipeline", "@azure/core-auth",
-    "@azure/core-client", "@azure/core-tracing", "@azure/core-util",
-    "@azure/core-http", "@azure/abort-controller", "@azure/logger",
-    "azure-core", "azure-common",
-}
 
 def mermaid_id(prefix: str, name: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9]", "_", str(name)).strip("_")
@@ -105,21 +75,6 @@ def mermaid_edge_label(text: str) -> str:
     if any(c in cleaned for c in "()[]{}:,;/\\"):
         return f'"{cleaned}"'
     return cleaned
-
-
-def storage_shape(node_id: str, label: str, category: Optional[str] = None) -> str:
-    cleaned_label = mermaid_label(label)
-    cat = (category or "").lower()
-    lbl = label.lower()
-    if any(k in cat or k in lbl for k in ("database", "cosmos", "postgres", "sql", "mongo", "dynamo", "gremlin", "sqlite", "table")):
-        return f'{node_id}[("{cleaned_label}")]'
-    if any(k in cat or k in lbl for k in ("blob", "storage", "s3", "bucket", "gcs", "disk", "file_system", "filesystem")):
-        return f'{node_id}(["{cleaned_label}"])'
-    if any(k in cat or k in lbl for k in ("cache", "redis", "memcached")):
-        return f'{node_id}{{{{"{cleaned_label}"}}}}'
-    if any(k in cat or k in lbl for k in ("queue", "stream", "kafka", "sqs", "event", "bus")):
-        return f'{node_id}(["{cleaned_label}"])'
-    return f'{node_id}["{cleaned_label}"]'
 
 
 def posix(path: Path | str) -> str:
@@ -165,20 +120,6 @@ def js_regex_to_path(rx: str) -> str:
     return normalize_route_path(rx)
 
 
-def classify_env(name: str) -> str:
-    lower = name.lower()
-    if any(x in lower for x in ("token", "secret", "key", "password", "auth", "credential")):
-        return "Secret / Token"
-    if any(x in lower for x in ("url", "host", "uri", "endpoint", "port", "connection")):
-        return "Endpoint / Connection"
-    if any(x in lower for x in ("enable", "disable", "flag", "allow", "mode")):
-        return "Feature Flag / Mode"
-    if any(x in lower for x in ("path", "dir", "root")):
-        return "Path / Directory"
-    return "Config Setting"
-
-
-
 def import_label(spec: str) -> str:
     """Keep the import the way it appears in source. Do not rename it to a cloud product."""
     spec = spec.strip()
@@ -197,11 +138,7 @@ def is_noise_import(spec: str) -> bool:
     top = label.split("/")[0].split(".")[0]
     if label in BUILTIN_MODULES or top in BUILTIN_MODULES:
         return True
-    if label in UI_PACKAGES or top in UI_PACKAGES:
-        return True
-    if label in AZURE_CORE_PACKAGES or spec in AZURE_CORE_PACKAGES:
-        return True
-    if label.startswith("@azure/core") or label.startswith("azure.core"):
+    if label.endswith("-core") or label.startswith(("@azure/core", "azure.core", "@aws-sdk/util")):
         return True
     return False
 
@@ -238,171 +175,6 @@ def symbol_import_uses(mod: "JsModule", sym: "Symbol") -> List[Tuple[str, str]]:
     return uses
 
 
-def parse_python_imports(text: str) -> Tuple[Set[str], Set[str]]:
-    modules: Set[str] = set()
-    names: Set[str] = set()
-    for m in re.finditer(r"^\s*from\s+([A-Za-z_][\w.]*)\s+import\s+([^\n#]+)", text, re.M):
-        modules.add(m.group(1))
-        for part in m.group(2).replace("(", " ").replace(")", " ").split(","):
-            part = part.strip()
-            if not part or part == "*":
-                continue
-            names.add(part.split(" as ")[-1].strip().split(".")[-1])
-    for m in re.finditer(r"^\s*import\s+([A-Za-z_][\w.]*)", text, re.M):
-        modules.add(m.group(1))
-    return modules, names
-
-
-# ---------------------------------------------------------------------------
-# Brace-matched JS/TS reader (deterministic structural analysis)
-# ---------------------------------------------------------------------------
-
-class JsSrc:
-    def __init__(self, text: str):
-        self.s = text
-        self.n = len(text)
-
-    def skip_ws_comments(self, i: int) -> int:
-        s, n = self.s, self.n
-        while i < n:
-            c = s[i]
-            if c in " \t\r\n":
-                i += 1
-                continue
-            if c == "/" and i + 1 < n and s[i + 1] == "/":
-                i += 2
-                while i < n and s[i] not in "\n\r":
-                    i += 1
-                continue
-            if c == "/" and i + 1 < n and s[i + 1] == "*":
-                i += 2
-                while i + 1 < n and not (s[i] == "*" and s[i + 1] == "/"):
-                    i += 1
-                i = min(n, i + 2)
-                continue
-            break
-        return i
-
-    def skip_string(self, i: int) -> int:
-        s, n = self.s, self.n
-        quote = s[i]
-        i += 1
-        if quote == "`":
-            while i < n:
-                if s[i] == "\\":
-                    i += 2
-                    continue
-                if s[i] == "`":
-                    return i + 1
-                if s[i] == "$" and i + 1 < n and s[i + 1] == "{":
-                    i = self.match_pair(i + 1)
-                    continue
-                i += 1
-            return i
-        while i < n:
-            if s[i] == "\\":
-                i += 2
-                continue
-            if s[i] == quote:
-                return i + 1
-            if s[i] in "\n\r" and quote != "`":
-                return i
-            i += 1
-        return i
-
-    def match_pair(self, i: int) -> int:
-        s, n = self.s, self.n
-        open_ch = s[i]
-        close_ch = {"(": ")", "[": "]", "{": "}"}.get(open_ch)
-        if not close_ch:
-            return i + 1
-        depth = 0
-        i += 1
-        while i < n:
-            c = s[i]
-            if c in "'\"`":
-                i = self.skip_string(i)
-                continue
-            if c == "/" and i + 1 < n and s[i + 1] in "/*":
-                i = self.skip_ws_comments(i)
-                continue
-            if c == "/" and self._maybe_regex(i):
-                i = self._skip_regex(i)
-                continue
-            if c == open_ch:
-                depth += 1
-                i += 1
-                continue
-            if c == close_ch:
-                if depth == 0:
-                    return i + 1
-                depth -= 1
-                i += 1
-                continue
-            i += 1
-        return i
-
-    def _maybe_regex(self, i: int) -> bool:
-        j = i - 1
-        while j >= 0 and self.s[j] in " \t":
-            j -= 1
-        if j < 0:
-            return True
-        return self.s[j] in "=([,!&|?:;{>~+-" or self.s[max(0, j - 5):j + 1].endswith("return")
-
-    def _skip_regex(self, i: int) -> int:
-        s, n = self.s, self.n
-        i += 1
-        in_class = False
-        while i < n:
-            c = s[i]
-            if c == "\\":
-                i += 2
-                continue
-            if c == "[" and not in_class:
-                in_class = True
-                i += 1
-                continue
-            if c == "]" and in_class:
-                in_class = False
-                i += 1
-                continue
-            if c == "/" and not in_class:
-                i += 1
-                while i < n and s[i].isalpha():
-                    i += 1
-                return i
-            if c in "\n\r":
-                return i
-            i += 1
-        return i
-
-    def body_after_params(self, i: int) -> Optional[Tuple[int, int]]:
-        i = self.skip_ws_comments(i)
-        if i >= self.n or self.s[i] != "(":
-            return None
-        i = self.match_pair(i)
-        i = self.skip_ws_comments(i)
-        if i < self.n - 1 and self.s[i:i + 2] == "=>":
-            i = self.skip_ws_comments(i + 2)
-        if i < self.n and self.s[i] == "{":
-            end = self.match_pair(i)
-            return i + 1, end - 1
-        return None
-
-
-def parse_regex_literal(src: JsSrc, i: int) -> Tuple[str, int]:
-    if i >= src.n or src.s[i] != "/":
-        return "", i
-    start = i + 1
-    i = src._skip_regex(i)
-    slash = src.s.rfind("/", start, i)
-    if slash < 0:
-        return "", i
-    return src.s[start:slash], i
-
-
-
 # ---------------------------------------------------------------------------
 # Mermaid & Markdown Linter (Zero-Dependency Syntax & Structure Validator)
 # ---------------------------------------------------------------------------
@@ -416,8 +188,6 @@ def lint_mermaid_flowchart(lines: List[Tuple[int, str]]) -> List[str]:
     errors = []
     subgraph_stack: List[Tuple[int, str]] = []
 
-    # Invalid composite delimiter sequences that break Mermaid grammar:
-    # e.g., ([("label")]) or [([label])] or ((["label"])) or [["label"]]
     invalid_delims = [
         (re.compile(r"\(\[\s*\(|\(\s*\[\s*\(|\(\s*\(\s*\[|\[\s*\[\s*\("), "Invalid composite opening delimiter (e.g. `([(` or `[([`)"),
         (re.compile(r"\)\s*\]\s*\)|\)\s*\)\s*\]|\]\s*\)\s*\]"), "Invalid composite closing delimiter (e.g. `)])` or `))]`)"),
@@ -436,7 +206,6 @@ def lint_mermaid_flowchart(lines: List[Tuple[int, str]]) -> List[str]:
             else:
                 subgraph_stack.pop()
 
-        # Check edge labels for unquoted special characters
         for m in re.finditer(r"(?:-->|-\.->|==>)\|([^|]+)\|", line):
             lbl_content = m.group(1).strip()
             if not (lbl_content.startswith('"') and lbl_content.endswith('"')):
@@ -455,7 +224,6 @@ def lint_mermaid_flowchart(lines: List[Tuple[int, str]]) -> List[str]:
             if pat.search(clean):
                 errors.append(f"Line {lineno}: {msg} in `{stripped}`")
 
-        # Check for unescaped / unclosed quotes in node labels on the same line
         code_part = clean.split("%%")[0]
         if code_part.count('"') % 2 != 0:
             errors.append(f"Line {lineno}: Unclosed or unmatched double quotes in `{stripped}`")
@@ -527,12 +295,10 @@ def lint_markdown(text: str, file_path: str = "") -> List[str]:
     errors = []
     file_prefix = f"{file_path}: " if file_path else ""
 
-    # 1. Check for unclosed code fences
     fence_count = len(re.findall(r"^```", text, re.M))
     if fence_count % 2 != 0:
         errors.append(f"{file_prefix}Unclosed Markdown code fence (found {fence_count} fence markers)")
 
-    # 2. Extract and lint all Mermaid blocks
     pattern = re.compile(r"^```mermaid[ \t]*\n(.*?)\n^```", re.M | re.S)
     for m in pattern.finditer(text):
         start_line = text[:m.start()].count("\n") + 2
@@ -541,7 +307,6 @@ def lint_markdown(text: str, file_path: str = "") -> List[str]:
         for err in block_errors:
             errors.append(f"{file_prefix}{err}")
 
-    # 3. Check Markdown table column consistency (outside code blocks)
     table_lines = []
     in_table = False
     in_fence = False
@@ -579,6 +344,7 @@ def lint_markdown(text: str, file_path: str = "") -> List[str]:
                 table_lines = []
 
     return errors
+
 
 # ---------------------------------------------------------------------------
 # Module model
@@ -631,6 +397,10 @@ class JsModule:
     entrypoint: Optional[str] = None
     io_kind: Set[str] = field(default_factory=set)
 
+
+# ---------------------------------------------------------------------------
+# Python AST Parsing (Pure Standard Library)
+# ---------------------------------------------------------------------------
 
 def _py_source_segment(text: str, node: ast.AST) -> str:
     if hasattr(ast, "get_source_segment"):
@@ -840,6 +610,150 @@ def parse_py_module(rel: str, text: str) -> Optional[JsModule]:
     return mod
 
 
+# ---------------------------------------------------------------------------
+# Brace-matched JS/TS reader (deterministic structural analysis)
+# ---------------------------------------------------------------------------
+
+class JsSrc:
+    def __init__(self, text: str):
+        self.s = text
+        self.n = len(text)
+
+    def skip_ws_comments(self, i: int) -> int:
+        s, n = self.s, self.n
+        while i < n:
+            c = s[i]
+            if c in " \t\r\n":
+                i += 1
+                continue
+            if c == "/" and i + 1 < n and s[i + 1] == "/":
+                i += 2
+                while i < n and s[i] not in "\n\r":
+                    i += 1
+                continue
+            if c == "/" and i + 1 < n and s[i + 1] == "*":
+                i += 2
+                while i + 1 < n and not (s[i] == "*" and s[i + 1] == "/"):
+                    i += 1
+                i = min(n, i + 2)
+                continue
+            break
+        return i
+
+    def skip_string(self, i: int) -> int:
+        s, n = self.s, self.n
+        quote = s[i]
+        i += 1
+        if quote == "`":
+            while i < n:
+                if s[i] == "\\":
+                    i += 2
+                    continue
+                if s[i] == "`":
+                    return i + 1
+                if s[i] == "$" and i + 1 < n and s[i + 1] == "{":
+                    i = self._skip_template_expr(i + 2)
+                    continue
+                i += 1
+            return n
+        while i < n:
+            if s[i] == "\\":
+                i += 2
+                continue
+            if s[i] == quote:
+                return i + 1
+            if s[i] in "\n\r":
+                return i
+            i += 1
+        return n
+
+    def _skip_template_expr(self, i: int) -> int:
+        s, n = self.s, self.n
+        depth = 1
+        while i < n and depth > 0:
+            i = self.skip_ws_comments(i)
+            if i >= n:
+                break
+            c = s[i]
+            if c in "'\"`":
+                i = self.skip_string(i)
+                continue
+            if c == "{":
+                depth += 1
+                i += 1
+                continue
+            if c == "}":
+                depth -= 1
+                i += 1
+                continue
+            i += 1
+        return i
+
+    def match_brace(self, open_pos: int) -> int:
+        s, n = self.s, self.n
+        if open_pos >= n or s[open_pos] != "{":
+            return -1
+        depth = 1
+        i = open_pos + 1
+        while i < n and depth > 0:
+            i = self.skip_ws_comments(i)
+            if i >= n:
+                break
+            c = s[i]
+            if c in "'\"`":
+                i = self.skip_string(i)
+                continue
+            if c == "/":
+                prev = self._prev_token_char(i)
+                if prev in "=:(,[!&|?{};\n\r" or prev is None:
+                    i = self._skip_regex(i)
+                    continue
+            if c == "{":
+                depth += 1
+                i += 1
+                continue
+            if c == "}":
+                depth -= 1
+                i += 1
+                if depth == 0:
+                    return i
+                continue
+            i += 1
+        return i if depth == 0 else -1
+
+    def _prev_token_char(self, pos: int) -> Optional[str]:
+        i = pos - 1
+        while i >= 0 and self.s[i] in " \t\r\n":
+            i -= 1
+        return self.s[i] if i >= 0 else None
+
+    def _skip_regex(self, i: int) -> int:
+        s, n = self.s, self.n
+        i += 1
+        in_class = False
+        while i < n:
+            if s[i] == "\\":
+                i += 2
+                continue
+            if s[i] == "[" and not in_class:
+                in_class = True
+                i += 1
+                continue
+            if s[i] == "]" and in_class:
+                in_class = False
+                i += 1
+                continue
+            if s[i] == "/" and not in_class:
+                i += 1
+                while i < n and s[i].isalpha():
+                    i += 1
+                return i
+            if s[i] in "\n\r":
+                return i
+            i += 1
+        return n
+
+
 def parse_js_module(rel: str, text: str) -> JsModule:
     src = JsSrc(text)
     mod = JsModule(file=rel, text=text)
@@ -857,45 +771,26 @@ def parse_js_module(rel: str, text: str) -> JsModule:
 
 def _extract_imports(mod: JsModule, text: str) -> None:
     for m in re.finditer(
-        r"import\s+(?:type\s+)?(?:(\*\s+as\s+(\w+))|(\{[^}]+\})|([A-Za-z_][\w]*))\s+from\s+['\"]([^'\"]+)['\"]",
+        r"""import\s+([\w\s{},*]+)\s+from\s+['"]([^'"]+)['"]"""
+        r"""|const\s+([\w\s{},*]+)\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)""",
         text,
     ):
-        spec = m.group(5)
-        names: List[str] = []
-        if m.group(2):
-            names.append(m.group(2))
-        elif m.group(3):
-            for part in m.group(3).strip("{}").split(","):
-                part = part.strip()
-                if not part:
-                    continue
-                if " as " in part:
-                    names.append(part.split(" as ")[-1].strip())
-                else:
-                    names.append(part.strip())
-        elif m.group(4):
-            names.append(m.group(4))
-        _bind_import(mod, names, spec)
-
-    for m in re.finditer(r"import\s+['\"]([^'\"]+)['\"]", text):
-        spec = m.group(1)
-        if not spec.startswith((".", "/", "~")):
-            mod.external_imports.add(normalize_pkg(spec))
-
-    for m in re.finditer(
-        r"(?:const|let|var)\s+(\{[^}]+\}|[A-Za-z_][\w]*)\s*=\s*require\(\s*['\"]([^'\"]+)['\"]\s*\)",
-        text,
-    ):
-        spec = m.group(2)
-        target = m.group(1)
+        names_blob = m.group(1) or m.group(3) or ""
+        spec = m.group(2) or m.group(4) or ""
         names = []
-        if target.startswith("{"):
-            for part in target.strip("{}").split(","):
-                part = part.strip()
-                if part:
-                    names.append(part.split(":")[0].strip())
-        else:
-            names.append(target)
+        if "{" in names_blob:
+            inside = names_blob[names_blob.find("{") + 1 : names_blob.find("}")]
+            for p in inside.split(","):
+                p = p.strip()
+                if not p:
+                    continue
+                names.append(p.split(" as ")[-1].strip().split(":")[-1].strip())
+        names_blob_clean = re.sub(r"\{[^}]*\}", "", names_blob).strip().strip(",")
+        if names_blob_clean:
+            for p in names_blob_clean.split(","):
+                p = p.strip()
+                if p and p != "*":
+                    names.append(p.split(" as ")[-1].strip())
         _bind_import(mod, names, spec)
 
 
@@ -903,94 +798,84 @@ def _bind_import(mod: JsModule, names: List[str], spec: str) -> None:
     if spec.startswith((".", "/", "~")):
         for name in names:
             mod.imports[name] = spec
-    else:
-        pkg = normalize_pkg(spec)
-        if pkg.startswith("node:"):
-            pkg = pkg.split(":", 1)[1]
-        if pkg not in BUILTIN_MODULES:
-            mod.external_imports.add(pkg)
-        for name in names:
-            mod.imports[name] = spec
+        return
+    pkg = import_label(spec)
+    if not is_noise_import(pkg):
+        mod.external_imports.add(pkg)
+    for name in names:
+        mod.imports[name] = spec
 
 
 def _extract_constants_urls_env(mod: JsModule, text: str) -> None:
-    for m in re.finditer(
-        r"(?:export\s+)?(?:const|let|var)\s+([A-Z][A-Z0-9_]*)\s*=\s*['\"]([^'\"]+)['\"]",
-        text,
-    ):
-        mod.constants[m.group(1)] = m.group(2)
-
-    for m in re.finditer(r"['\"](https?://[^'\"]+)['\"]", text):
+    for m in re.finditer(r"""const\s+([A-Za-z0-9_]+)\s*=\s*['"]([^'"]+)['"]""", text):
+        name, val = m.group(1), m.group(2)
+        mod.constants[name] = val
+        if val.startswith("http://") or val.startswith("https://"):
+            if not any(x in val for x in ("localhost", "127.0.0.1", "example.com", "example.org")):
+                mod.urls.append(val)
+    for m in re.finditer(r"""['"](https?://[^'"]+)['\"]""", text):
         url = m.group(1)
         if any(x in url for x in ("localhost", "127.0.0.1", "example.com", "example.org")):
             continue
-        mod.urls.append(url)
-
-    for m in re.finditer(
-        r"(?:process\.env|Bun\.env|import\.meta\.env)(?:\.([A-Za-z0-9_]+)|\[['\"]([A-Za-z0-9_]+)['\"]\])",
-        text,
-    ):
+        if url not in mod.urls:
+            mod.urls.append(url)
+    for m in re.finditer(r"""process\.env\.([A-Za-z0-9_]+)|process\.env\[['"]([A-Za-z0-9_]+)['"]\]""", text):
         name = m.group(1) or m.group(2)
-        if name and name not in ("NODE_ENV", "npm_package_version"):
+        if name:
             mod.env_vars.add(name)
 
 
 def _extract_classes(mod: JsModule, src: JsSrc) -> None:
     for m in re.finditer(r"(?:export\s+)?class\s+([A-Za-z_][\w]*)", src.s):
+        name = m.group(1)
         i = src.skip_ws_comments(m.end())
-        if i < src.n and src.s.startswith("extends", i):
+        if i < src.n and src.s[i : i + 7] == "extends":
             i = src.skip_ws_comments(i + 7)
-            while i < src.n and (src.s[i].isalnum() or src.s[i] in "._$"):
+            while i < src.n and src.s[i] not in "{ \t\r\n":
                 i += 1
             i = src.skip_ws_comments(i)
         if i >= src.n or src.s[i] != "{":
             continue
-        end = src.match_pair(i)
-        body = src.s[i + 1:end - 1]
-        sym = Symbol(name=m.group(1), kind="class", file=mod.file, body=body)
+        end = src.match_brace(i)
+        if end < 0:
+            continue
+        body = src.s[i + 1 : end - 1]
+        sym = Symbol(name=name, kind="class", file=mod.file, body=body)
         _extract_methods(sym, body)
+        sym.bindings = _const_bindings(body)
         sym.constructed = _constructed_types(body)
-        sym.return_news = re.findall(r"\breturn\s+new\s+([A-Z][A-Za-z0-9_]*)\s*\(", body)
         mod.classes[sym.name] = sym
 
 
 def _extract_methods(sym: Symbol, body: str) -> None:
     inner = JsSrc(body)
-    for m in re.finditer(r"(?:async\s+)?(?:static\s+)?(\#?[A-Za-z_][\w]*)\s*\(", body):
+    for m in re.finditer(
+        r"(?:async\s+)?(?:get\s+|set\s+)?(\#?[A-Za-z_][\w]*)\s*\([^)]*\)\s*\{",
+        body,
+    ):
         name = m.group(1)
-        if name in SKIP_CALL_NAMES:
+        if name in ("if", "for", "while", "switch", "catch", "function"):
             continue
-        span = inner.body_after_params(m.end() - 1)
-        if not span:
+        brace_pos = m.end() - 1
+        end = inner.match_brace(brace_pos)
+        if end < 0:
             continue
-        method_body = body[span[0]:span[1]]
-        if name == "constructor":
-            sym.bindings.update(_const_bindings(method_body))
-            for bm in re.finditer(r"this\.([A-Za-z_][\w]*)\s*=\s*([A-Za-z_][\w]*)", method_body):
-                if bm.group(1) == bm.group(2):
-                    sym.bindings[bm.group(1)] = bm.group(2)
+        method_body = body[brace_pos + 1 : end - 1]
         sym.methods[name] = method_body
 
 
 def _extract_functions(mod: JsModule, src: JsSrc) -> None:
     for m in re.finditer(
-        r"(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+(\#?[A-Za-z_][\w]*)\s*\(",
+        r"(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_][\w]*)\s*\([^)]*\)\s*\{"
+        r"|(?:export\s+)?const\s+([A-Za-z_][\w]*)\s*=\s*(?:async\s+)?(?:\([^)]*\)|[A-Za-z_][\w]*)\s*=>\s*\{",
         src.s,
     ):
-        span = src.body_after_params(m.end() - 1)
-        if not span:
+        name = m.group(1) or m.group(2)
+        brace_pos = m.end() - 1
+        end = src.match_brace(brace_pos)
+        if end < 0:
             continue
-        body = src.s[span[0]:span[1]]
-        _add_function(mod, m.group(1), body)
-
-    for m in re.finditer(
-        r"(?:export\s+)?(?:const|let|var)\s+([A-Za-z_][\w]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_][\w]*)\s*=>",
-        src.s,
-    ):
-        i = src.skip_ws_comments(m.end())
-        if i < src.n and src.s[i] == "{":
-            end = src.match_pair(i)
-            _add_function(mod, m.group(1), src.s[i + 1:end - 1])
+        _add_function(mod, name, src.s[brace_pos + 1 : end - 1])
 
 
 def _add_function(mod: JsModule, name: str, body: str) -> None:
@@ -998,28 +883,26 @@ def _add_function(mod: JsModule, name: str, body: str) -> None:
     sym.bindings = _const_bindings(body)
     sym.constructed = _constructed_types(body)
     sym.return_news = re.findall(r"\breturn\s+new\s+([A-Z][A-Za-z0-9_]*)\s*\(", body)
-    for cm in re.finditer(r"(?:async\s+)?function\s+(\#?[A-Za-z_][\w]*)\s*\(", body):
-        inner = JsSrc(body)
-        span = inner.body_after_params(cm.end() - 1)
-        if span:
-            sym.methods[cm.group(1)] = body[span[0]:span[1]]
+    fn_returns = re.findall(r"\breturn\s+([A-Za-z0-9_]+)\s*\(", body)
+    if fn_returns:
+        for f in fn_returns:
+            if f[:1].isupper():
+                sym.return_news.append(f)
     mod.functions[name] = sym
 
 
 def _const_bindings(body: str) -> Dict[str, str]:
     bindings: Dict[str, str] = {}
     for m in re.finditer(
-        r"(?:const|let|var)\s+([A-Za-z_][\w]*)\s*=\s*[^;]{0,400}?\bnew\s+([A-Z][A-Za-z0-9_]*)\s*\(",
+        r"(?:const|let|var)\s+([A-Za-z0-9_]+)\s*=\s*new\s+([A-Z][A-Za-z0-9_]*)\s*\("
+        r"|(?:const|let|var)\s+([A-Za-z0-9_]+)\s*=\s*(create[A-Za-z0-9_]+)\s*\(",
         body,
-        re.S,
     ):
-        bindings[m.group(1)] = m.group(2)
-    for m in re.finditer(
-        r"(?:const|let|var)\s+([A-Za-z_][\w]*)\s*=\s*[^;]{0,400}?\b(create[A-Z][A-Za-z0-9_]*)\s*\(",
-        body,
-        re.S,
-    ):
-        bindings.setdefault(m.group(1), m.group(2))
+        var1, typ1, var2, typ2 = m.group(1), m.group(2), m.group(3), m.group(4)
+        if var1 and typ1:
+            bindings[var1] = typ1
+        elif var2 and typ2:
+            bindings[var2] = typ2
     return bindings
 
 
@@ -1029,137 +912,99 @@ def _constructed_types(body: str) -> List[str]:
 
 def _without_comments(src_text: str) -> str:
     src_text = re.sub(r"/\*.*?\*/", "", src_text, flags=re.S)
-    src_text = re.sub(r"^\s*//.*$", "", src_text, flags=re.M)
-    src_text = re.sub(r"\s//.*$", "", src_text, flags=re.M)
+    src_text = re.sub(r"//[^\n]*", "", src_text)
     return src_text
 
 
 def _extract_spawns(mod: JsModule, text: str) -> None:
     code = _without_comments(text)
-    for m in re.finditer(r"\bspawn(?:Process)?\s*\(\s*['\"]([^'\"]+)['\"]", code):
-        cmd = m.group(1).strip()
-        if cmd and cmd not in {"help", "-h", "--help"}:
+    for m in re.finditer(
+        r"""(?:spawn|spawnProcess|execFile|fork)\(\s*(?:\[\s*)?['"]([^'"]+)['"]""",
+        code,
+    ):
+        cmd = Path(m.group(1)).name
+        if cmd not in mod.spawns:
             mod.spawns.append(cmd)
-    if re.search(r"(?:this\.)?spawn(?:Process)?\s*\(\s*(?:this\.)?command\b", code):
-        defaults = re.findall(r"command\s*=\s*['\"]([^'\"]+)['\"]", code)
-        defaults += re.findall(r"command:\s*options\.\w+\s*\?\?\s*['\"]([^'\"]+)['\"]", code)
-        defaults += re.findall(r"command\s*=\s*options\.\w+\s*\?\?\s*['\"]([^'\"]+)['\"]", code)
-        for cmd in defaults:
-            if cmd not in {"help", "-h", "--help"}:
-                mod.spawns.append(cmd)
 
 
 def _extract_routes(mod: JsModule, src: JsSrc) -> None:
     text = src.s
     for m in re.finditer(
-        r"if\s*\(\s*method\s*===?\s*['\"](GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)['\"]\s*&&\s*"
-        r"(?:url\.pathname|pathname)\s*===?\s*['\"]([^'\"]+)['\"]\s*\)",
-        text,
-    ):
-        body = _block_after(src, m.end())
-        mod.routes.append(Route(m.group(1).upper(), m.group(2), mod.file, body, _nearest_scope(mod, m.start()), "server"))
-
-    for m in re.finditer(
-        r"if\s*\(\s*(?:url\.pathname|pathname)\s*===?\s*['\"]([^'\"]+)['\"]\s*&&\s*"
-        r"method\s*===?\s*['\"](GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)['\"]\s*\)",
-        text,
-    ):
-        body = _block_after(src, m.end())
-        mod.routes.append(Route(m.group(2).upper(), m.group(1), mod.file, body, _nearest_scope(mod, m.start()), "server"))
-
-    for m in re.finditer(
-        r"(?:const|let|var)\s+(\w+)\s*=\s*(?:url\.pathname|pathname)\.match\(\s*/",
-        text,
-    ):
-        rx, after = parse_regex_literal(src, m.end() - 1)
-        if not rx:
-            continue
-        path = js_regex_to_path(rx)
-        window = text[after:after + 400]
-        mm = re.search(r"method\s*===?\s*['\"](GET|POST|PUT|DELETE|PATCH)['\"]", window)
-        method = mm.group(1).upper() if mm else "GET"
-        if_match = re.search(rf"if\s*\([^)]*{re.escape(m.group(1))}[^)]*\)", text[after:after + 800])
-        body = ""
-        if if_match:
-            body = _block_after(src, after + if_match.end())
-        mod.routes.append(Route(method, path, mod.file, body, _nearest_scope(mod, m.start()), "server"))
-
-    for m in re.finditer(
-        r"(?:app|router)\.(get|post|put|delete|patch|options|head)\s*\(\s*['\"]([^'\"]+)['\"]",
+        r"""(?:app|router|server)\.(get|post|put|delete|patch)\(\s*['"]([^'"]+)['"]""",
         text,
         re.I,
     ):
+        method, path = m.group(1).upper(), m.group(2)
         body = _block_after(src, m.end())
-        mod.routes.append(Route(m.group(1).upper(), m.group(2), mod.file, body, _nearest_scope(mod, m.start()), "server"))
+        mod.routes.append(Route(method, path, mod.file, body, _nearest_scope(mod, m.start()), "server"))
 
-    for m in re.finditer(r"/(\^\\?/attachments\\?/[^/\n]+\\?/[^/\n]+\$?)/", text):
-        path = js_regex_to_path(m.group(1))
-        if "image" in path or "attachment" in path:
-            if not any(r.path == path for r in mod.routes):
-                mod.routes.append(Route("GET", path, mod.file, "", _nearest_scope(mod, m.start()), "server"))
+    for m in re.finditer(
+        r"""(?:if\s*\(\s*)?method\s*===\s*['"](GET|POST|PUT|DELETE|PATCH)['"]\s*&&\s*(?:url\.pathname|pathname|path|req\.url)\s*===\s*['"]([^'"]+)['"]""",
+        text,
+    ):
+        method, path = m.group(1), m.group(2)
+        body = _block_after(src, m.end())
+        mod.routes.append(Route(method, path, mod.file, body, _nearest_scope(mod, m.start()), "server"))
 
 
 def _block_after(src: JsSrc, i: int) -> str:
     i = src.skip_ws_comments(i)
-    if i < src.n and src.s[i] == "{":
-        end = src.match_pair(i)
-        return src.s[i + 1:end - 1]
+    idx = src.s.find("{", i)
+    if 0 <= idx < i + 120:
+        end = src.match_brace(idx)
+        if end > idx:
+            return src.s[idx + 1 : end - 1]
     return ""
 
 
 def _nearest_scope(mod: JsModule, pos: int) -> str:
     best = ""
-    best_pos = -1
-    for name, _sym in list(mod.functions.items()) + list(mod.classes.items()):
-        idx = mod.text.find(f"function {name}")
-        if idx < 0:
-            idx = mod.text.find(f"const {name}")
-        if idx < 0:
-            idx = mod.text.find(f"class {name}")
-        if 0 <= idx <= pos and idx > best_pos:
-            best_pos = idx
+    best_start = -1
+    for name, sym in mod.functions.items():
+        idx = mod.text.find(name)
+        if 0 <= idx <= pos and idx > best_start:
             best = name
+            best_start = idx
+    for name, sym in mod.classes.items():
+        idx = mod.text.find(name)
+        if 0 <= idx <= pos and idx > best_start:
+            best = name
+            best_start = idx
     return best
 
 
 def _extract_client_api(mod: JsModule, src: JsSrc) -> None:
     for fn in mod.functions.values():
         for m in re.finditer(
-            r"([A-Za-z_][\w]*)\s*:\s*(?:async\s*)?(?:function\s*)?(?:\([^)]*\)|[A-Za-z_][\w]*)?\s*=>\s*"
-            r"(?:[A-Za-z_][\w]*\s*)?request\(\s*([`'\"])([^`'\"]+)\2",
+            r"""([A-Za-z0-9_]+)\s*\([^)]*\)\s*\{\s*return\s+(?:this\.)?request\(\s*['"](GET|POST|PUT|DELETE|PATCH)['"]\s*,\s*['"]([^'"]+)['"]""",
             fn.body,
         ):
-            method = "GET"
-            window = fn.body[m.end():m.end() + 180]
-            mm = re.search(r"method\s*:\s*['\"](GET|POST|PUT|DELETE|PATCH)['\"]", window)
-            if mm:
-                method = mm.group(1).upper()
-            elif m.group(1).lower().startswith(("send", "create", "update", "register", "interrupt", "post")):
-                method = "POST"
-            path = normalize_route_path(m.group(3))
-            mod.client_calls.append((m.group(1), method, path))
+            mod.client_calls.append((m.group(1), m.group(2), m.group(3)))
+        for m in re.finditer(
+            r"""(?:const|let|var)\s+([A-Za-z0-9_]+)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>\s*request\(\s*['"](GET|POST|PUT|DELETE|PATCH)['"]\s*,\s*['"]([^'"]+)['"]""",
+            fn.body,
+        ):
+            mod.client_calls.append((m.group(1), m.group(2), m.group(3)))
 
 
 def _detect_entrypoint(mod: JsModule, text: str) -> None:
     if re.search(r"\bregisterRootComponent\s*\(", text):
         mod.entrypoint = "ui"
-    elif re.search(r"\bhttp\.createServer\s*\(|\bcreateServer\s*\(|\bapp\.listen\s*\(", text):
+    elif re.search(r"\bcreateRoot\s*\(|ReactDOM\.render\s*\(", text):
+        mod.entrypoint = "ui"
+    elif re.search(r"\bcreateServer\s*\(|app\.listen\s*\(|fastify\.listen\s*\(", text):
         mod.entrypoint = "http"
-    elif re.search(r"\blisten\s*\(\s*(?:port|host)\b", text) and "createBridgeServer" in text:
-        mod.entrypoint = "http"
-    elif Path(mod.file).name in {"index.js", "main.js", "server.js", "App.js", "app.js"} and "createServer" in text:
+    elif "createBridgeServer" in mod.functions:
         mod.entrypoint = "http"
 
 
 def _detect_io(mod: JsModule, text: str) -> None:
     if re.search(r"\bfetch\s*\(|\brequest\s*\(|createServer\s*\(|\bapp\.(get|post)\s*\(", text):
-        mod.io_kind.add("http")
-    if re.search(r"\bspawn\s*\(|spawnProcess", text):
+        mod.io_kind.add("http-server" if "createServer" in text else "http-client")
+    if re.search(r"\bspawn\s*\(|\bexecFile\s*\(|\bfork\s*\(", text):
         mod.io_kind.add("process")
-    if re.search(r"\b(readFile|writeFile|readdir|createReadStream|homedir)\s*\(", text):
+    if re.search(r"\breadFile\b|\bwriteFile\b|\bstat\b|\bopen\b", text):
         mod.io_kind.add("disk")
-    if any(pkg in mod.external_imports for pkg in DEVICE_IO_PACKAGES):
-        mod.io_kind.add("device")
     if mod.urls:
         mod.io_kind.add("http-external")
 
@@ -1170,50 +1015,68 @@ def extract_calls(body: str) -> List[Call]:
         r"(?:await\s+)?((?:this\.)?\#?[A-Za-z_][\w]*)(?:\.(\#?[A-Za-z_][\w]*))*\s*\(",
         body,
     ):
-        parts = re.findall(r"\#?[A-Za-z_][\w]*", m.group(0).split("(")[0].replace("await", ""))
-        parts = [p for p in parts if p != "await"]
-        if not parts:
-            continue
-        if parts[0] in SKIP_CALL_NAMES:
-            continue
+        raw = m.group(0)
+        parts = raw.split("(")[0].strip().replace("await ", "").split(".")
         if len(parts) == 1:
-            calls.append(Call(None, parts[0], parts, m.group(0)))
+            recv = None
+            method = parts[0]
+            chain = []
         else:
-            calls.append(Call(parts[0], parts[-1], parts, m.group(0)))
+            recv = parts[0]
+            method = parts[-1]
+            chain = parts[1:-1]
+        calls.append(Call(recv=recv, method=method, chain=chain, raw=raw))
     return calls
 
 
 def body_fields(body: str) -> List[str]:
     fields = []
     seen = set()
-    for m in re.finditer(r"(?<![\w.])body\.([A-Za-z_][\w]*)", body):
-        if m.group(1) not in seen and m.group(1) not in {"ok", "error", "status", "get", "items", "keys", "values"}:
-            seen.add(m.group(1))
-            fields.append(m.group(1))
+    for m in re.finditer(r"(?:body|payload|req\.body)\.([A-Za-z0-9_]+)", body):
+        f = m.group(1)
+        if f not in seen and f not in {"ok", "error", "status", "get", "items", "keys", "values"}:
+            seen.add(f)
+            fields.append(f)
+    for m in re.finditer(r"""(?:body|payload|req\.body)\[['"]([A-Za-z0-9_]+)['"]\]""", body):
+        f = m.group(1)
+        if f not in seen and f not in {"ok", "error", "status", "get", "items", "keys", "values"}:
+            seen.add(f)
+            fields.append(f)
     return fields
 
 
-SKIP_TRACE = {
-    "sendJson", "readJson", "httpError", "projectMessageResult", "normalizePromptInput",
-    "normalizeImageAttachments", "stringValue", "timestampFrom", "requestOrigin",
-    "remove", "prune", "listSessions", "listDevices", "readInternetProbe",
-    "internetFailureDetails", "publicPhoneView", "normalizeNonNegativeMs",
-    "projectPrivateToolImageAttachments", "timeMsFrom", "shortSessionId",
-    "createSessionTitle", "createId", "nowIso", "normalizeImageAttachment",
-    "buildHealthPayload",
-}
+# ---------------------------------------------------------------------------
+# Optional LSP Client (Cross-file compiler precision via JSON-RPC)
+# ---------------------------------------------------------------------------
 
-RECURSE_METHODS = {
-    "sendMessage", "startMessage", "prompt", "request", "start", "interrupt",
-    "sendNotification", "sendExpoPushRequest", "put", "#runPrompt",
-    "run", "retrieve", "upsert", "get_secret", "track", "invoke",
-    "create_agent", "create_thread", "create_message", "create_and_process_run",
-}
+class LspClient:
+    """Lightweight JSON-RPC client for local language servers (opt-in via --lsp)."""
 
-SERVICE_CREATE_RE = re.compile(
-    r"^create(?:[A-Z].*(?:Server|Store|Api|API|Cache|State|Reader|Registry|Index|Client|Transport)"
-    r"|_.*(?:server|store|api|cache|state|reader|registry|index|client|transport|agent|app|telemetry))$"
-)
+    def __init__(self, root: Path, server_cmd: List[str]):
+        self.root = root
+        self.server_cmd = server_cmd
+        self.proc: Optional[subprocess.Popen] = None
+
+    def start(self) -> bool:
+        try:
+            self.proc = subprocess.Popen(
+                self.server_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                cwd=str(self.root),
+            )
+            return True
+        except Exception:
+            return False
+
+    def close(self) -> None:
+        if self.proc:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=2)
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1221,11 +1084,12 @@ SERVICE_CREATE_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 class ArchitectureScanner:
-    def __init__(self, root_path: str):
+    def __init__(self, root_path: str, use_lsp: bool = False):
         self.root = Path(root_path).resolve()
         if not self.root.exists():
             raise FileNotFoundError(f"Target path does not exist: {self.root}")
         self.repo_name = self.root.name
+        self.use_lsp = use_lsp
         self.modules: Dict[str, JsModule] = {}
         self.manifest_deps: Dict[str, Set[str]] = defaultdict(set)
         self.all_manifest_deps: Set[str] = set()
@@ -1234,7 +1098,6 @@ class ArchitectureScanner:
         self.consumed_env_vars: Dict[str, Set[str]] = defaultdict(set)
         self.resolved_index: Dict[str, Tuple[str, str]] = {}
         self.trace_route_spec: Optional[str] = None
-        self.py_modules: Dict[str, dict] = {}
         self.import_uses: List[dict] = []
 
     def scan(self) -> None:
@@ -1416,7 +1279,6 @@ class ArchitectureScanner:
         if not spec.startswith("."):
             return None
         base = (self.root / from_file).parent / spec
-        # Python: from .blob import x  -> spec ".blob"
         if spec.startswith(".") and not spec.startswith("./") and not spec.startswith("../"):
             level = 0
             rest = spec
@@ -1491,16 +1353,6 @@ class ArchitectureScanner:
                 seen.add(key)
                 route.path = normalize_route_path(route.path)
                 out.append(route)
-        for pym in self.py_modules.values():
-            if is_test_path(pym["file"]):
-                continue
-            for route in pym["routes"]:
-                key = (route.method, normalize_route_path(route.path))
-                if key in seen:
-                    continue
-                seen.add(key)
-                route.path = normalize_route_path(route.path)
-                out.append(route)
         return out
 
     def runtimes(self) -> Dict[str, dict]:
@@ -1534,31 +1386,10 @@ class ArchitectureScanner:
                         "files": {rel},
                     })
                     g["files"].add(rel)
-        for rel, pym in self.py_modules.items():
-            if is_test_path(rel) or is_ops_path(rel):
-                continue
-            if not (pym["entrypoint"] or pym["routes"]):
-                continue
-            top = rel.split("/")[0] if "/" in rel else "root"
-            g = groups.setdefault(top, {
-                "id": top,
-                "kind": "http",
-                "entrypoints": [],
-                "files": set(),
-            })
-            g["kind"] = "http"
-            g["entrypoints"].append(rel)
-            g["files"].add(rel)
         for g in groups.values():
             for ep in list(g["entrypoints"]):
                 if ep in self.modules:
                     g["files"] |= self._local_import_tree(ep, 8)
-            top = g["id"]
-            for rel in list(self.py_modules):
-                if is_test_path(rel) or is_ops_path(rel):
-                    continue
-                if (rel.split("/")[0] if "/" in rel else "root") == top:
-                    g["files"].add(rel)
         if not groups and self.import_uses:
             groups["app"] = {
                 "id": "app",
@@ -1588,26 +1419,30 @@ class ArchitectureScanner:
         return seen
 
     def architectural_components(self, runtime: dict) -> List[dict]:
+        """Discovers components based on structural role (imports, constructors, routes)."""
         comps = []
         seen_names = set()
         for rel in sorted(runtime["files"]):
             mod = self.modules.get(rel)
             if not mod or is_test_path(rel):
                 continue
-            if mod.entrypoint == "ui" and Path(rel).name == "index.js":
-                continue
-            if mod.entrypoint == "http" and not mod.routes and "createBridgeServer" not in mod.functions:
-                if not any(name.startswith("create") and "Server" in name for name in mod.functions):
-                    continue
             for sym in list(mod.classes.values()) + list(mod.functions.values()):
-                if not self._keep_symbol(sym, mod, runtime):
+                name = sym.name
+                if name in seen_names or name.startswith("Fake") or name.endswith("Error"):
                     continue
-                if sym.name in seen_names:
+                is_component = (
+                    sym.kind == "class"
+                    or bool(self.uses_for(rel, name))
+                    or bool(sym.constructed)
+                    or bool(sym.return_news)
+                    or any(r.scope == name for r in mod.routes)
+                )
+                if not is_component:
                     continue
-                seen_names.add(sym.name)
+                seen_names.add(name)
                 comps.append({
-                    "id": mermaid_id("C", sym.name),
-                    "name": sym.name,
+                    "id": mermaid_id("C", name),
+                    "name": name,
                     "file": rel,
                     "kind": sym.kind,
                     "runtime": runtime["id"],
@@ -1615,56 +1450,13 @@ class ArchitectureScanner:
         ranked = []
         for c in comps:
             score = 0
-            if c["name"].endswith(("Server", "Store", "Transport", "Registry", "Index", "Api", "API", "Agent")):
-                score += 30
-            if c["name"].endswith(("_store", "_index", "_reader", "_agent", "_app", "_telemetry")):
-                score += 25
-            if c["name"].startswith("create") and SERVICE_CREATE_RE.match(c["name"]):
-                score += 20
             if c["kind"] == "class":
-                score += 10
-            if c["name"].startswith("Fake"):
-                score -= 50
+                score += 30
+            if any(u["function"] == c["name"] for u in self.import_uses):
+                score += 25
             ranked.append((score, c["name"], c))
         ranked.sort(key=lambda x: (-x[0], x[1]))
-        return [c for _, _, c in ranked[:14]]
-
-    def _component_title(self, mod: JsModule, fallback: str) -> str:
-        if mod.entrypoint == "ui":
-            return "App"
-        if "createServer" in mod.text or "createBridgeServer" in mod.text:
-            if "createBridgeServer" in mod.functions:
-                return "createBridgeServer"
-            return "HTTP server"
-        return fallback
-
-    def _keep_symbol(self, sym: Symbol, mod: JsModule, runtime: dict) -> bool:
-        name = sym.name
-        if UTIL_NAME_RE.match(name) or name.endswith("Error"):
-            return False
-        if name.startswith("Fake"):
-            return False
-        if is_ops_path(mod.file) or "/ui/" in mod.file.replace("\\", "/"):
-            return False
-        if Path(mod.file).name in {"theme.js", "log.js", "ids.js", "dev-warn.js", "message-rendering.js"}:
-            return False
-        if name.startswith("default") and name.endswith(("Index", "Probe", "Factory")):
-            return False
-        if "ViewState" in name or name.endswith("View"):
-            return False
-        if name in {"startBridge", "start"}:
-            return False
-        if sym.kind == "class":
-            return True
-        if SERVICE_CREATE_RE.match(name):
-            return True
-        if name in {"App"} and runtime.get("kind") == "ui":
-            return True
-        if name.startswith("create") and ("createServer" in sym.body or "request(" in sym.body):
-            return True
-        if any(u["function"] == name and u["file"] == mod.file for u in self.import_uses):
-            return True
-        return False
+        return [c for _, _, c in ranked[:16]]
 
     def externals(self, include_device: bool = False) -> List[dict]:
         items = {}
@@ -1699,16 +1491,11 @@ class ArchitectureScanner:
                     continue
                 if "/ui/" in rel.replace("\\", "/"):
                     continue
-                if "exp.host" in url and "push" in url:
-                    add("Expo Push API", "http", url, 10, {rel})
-                elif "generate_204" in url or "gstatic" in url:
-                    add("Internet probe", "http", url, 9, {rel})
-                else:
-                    add(host, "http", url, 5, {rel})
+                add(host, "http", url, 8, {rel})
             for cmd in mod.spawns:
                 add(f"{cmd} process", "process", f"spawn({cmd})", 10, {rel})
-            if "disk" in mod.io_kind and ("sessions" in mod.text or "homedir" in mod.text):
-                add("Local session files", "disk", rel, 8, {rel})
+            if "disk" in mod.io_kind:
+                add("Local disk files", "disk", rel, 8, {rel})
         return [items[k] for k in sorted(items, key=lambda n: (-items[n]["rank"], n))]
 
     def composition_edges(self, components: List[dict]) -> List[Tuple[str, str, str]]:
@@ -1726,7 +1513,6 @@ class ArchitectureScanner:
             seen.add(key)
             edges.append((a, b, label))
 
-        stores = [c for c in components if c["name"].endswith("Store") and not c["name"].startswith("create")]
         for c in components:
             mod = self.modules.get(c["file"])
             if not mod:
@@ -1734,33 +1520,18 @@ class ArchitectureScanner:
             sym = mod.classes.get(c["name"]) or mod.functions.get(c["name"])
             if not sym:
                 continue
-            if c["name"].endswith("Server") or SERVICE_CREATE_RE.match(c["name"] or ""):
-                for bound_type in dict.fromkeys(list(sym.bindings.values()) + sym.constructed):
-                    if bound_type.startswith("Fake") or bound_type.endswith("Error"):
-                        continue
-                    target = by_name.get(bound_type)
-                    if target:
-                        link(c["id"], target["id"], "owns")
-        for fn_mod in self.modules.values():
-            if is_test_path(fn_mod.file) or is_ops_path(fn_mod.file):
-                continue
-            for fn in fn_mod.functions.values():
-                if "Factory" not in fn.name and "transport" not in fn.name.lower():
-                    continue
-                news = [n for n in (fn.return_news or _constructed_types(fn.body)) if not n.startswith("Fake")]
-                if not news:
-                    continue
-                target = by_name.get(news[-1])
-                for store in stores:
-                    if target:
-                        link(store["id"], target["id"], "transport")
+            for bound_type in dict.fromkeys(list(sym.bindings.values()) + sym.constructed + sym.return_news):
+                target = by_name.get(bound_type)
+                if target:
+                    link(c["id"], target["id"], "owns")
+
         api = next((c for c in components if c["name"].endswith("Api") or c["name"].endswith("API")), None)
         app = by_name.get("App")
-        server = next((c for c in components if "Server" in c["name"]), None)
+        server = next((c for c in components if "Server" in c["name"] or "app" in c["name"]), None)
         if app and api:
             link(app["id"], api["id"], "uses")
         if api and server:
-            link(api["id"], server["id"], "HTTP + Bearer")
+            link(api["id"], server["id"], "HTTP")
         return edges
 
     def choose_flow_route(self) -> Optional[Route]:
@@ -1805,9 +1576,7 @@ class ArchitectureScanner:
                 "file": file,
             })
 
-        add("User", "HTTP", f"{route.method} {route.path}", "authenticated HTTP", route.file)
-        if "isAuthorized" in (self.modules.get(route.file).text if route.file in self.modules else ""):
-            add("HTTP", "isAuthorized", "Bearer / loopback check", "401 or continue", route.file)
+        add("User", "HTTP", f"{route.method} {route.path}", "HTTP Request", route.file)
 
         def walk(src, file, name, body, depth):
             if depth > max_depth or len(steps) > 22:
@@ -1838,20 +1607,15 @@ class ArchitectureScanner:
             mod = self.modules.get(file)
             imported = mod.imports if mod else {}
             for call in extract_calls(body):
-                if call.method in SKIP_TRACE or call.method in SKIP_CALL_NAMES:
-                    continue
                 if call.recv in {None, "self", "this"} and call.method == name:
                     continue
                 target_name = call.method
                 recv_type = None
                 if call.recv in {None, "this"} and walking and target_name in walking.methods:
-                    if target_name not in RECURSE_METHODS:
-                        continue
                     recv_type = walking.name
                 elif call.recv and call.recv not in {"this", "options", "console"}:
                     recv_type = local_bindings.get(call.recv)
-                    if call.recv == "session" and "transport" in call.chain:
-                        recv_type = self._infer_transport(file) or recv_type
+
                 pkg = None
                 if call.recv and call.recv in imported and not is_noise_import(imported[call.recv]):
                     pkg = import_label(imported[call.recv])
@@ -1860,6 +1624,7 @@ class ArchitectureScanner:
                 if pkg:
                     add(src, pkg, target_name, call.recv or recv_type, file)
                     continue
+
                 resolved = None
                 if recv_type:
                     resolved = self.lookup_symbol(file, recv_type)
@@ -1868,7 +1633,7 @@ class ArchitectureScanner:
                 if resolved and resolved.kind == "function" and resolved.return_news:
                     for cand in reversed(resolved.return_news):
                         cls = self.lookup_symbol(resolved.file, cand) or self.lookup_symbol(file, cand)
-                        if cls and cls.kind == "class" and (target_name in cls.methods or target_name in RECURSE_METHODS):
+                        if cls and cls.kind == "class" and target_name in cls.methods:
                             resolved = cls
                             break
                 if not resolved:
@@ -1876,56 +1641,20 @@ class ArchitectureScanner:
                 if resolved.name.endswith("Error") or resolved.name.startswith("Fake"):
                     continue
                 actor = resolved.name
-                if actor in SKIP_TRACE:
-                    continue
                 if actor == src and call.recv in {None, "self", "this"}:
                     continue
-                interesting = (
-                    resolved.kind == "class"
-                    or target_name in RECURSE_METHODS
-                    or SERVICE_CREATE_RE.match(resolved.name or "")
-                    or bool(self.uses_for(resolved.file, resolved.name))
-                    or target_name in {"storeMessageAttachments", "getResumeSession", "sendMessage", "startMessage"}
-                )
-                if not interesting:
-                    continue
+
                 add(src, actor, target_name, call.raw.strip()[:70], resolved.file)
-                next_body = resolved.methods.get(target_name) or resolved.methods.get("#runPrompt") or resolved.body
-                if next_body and (target_name in RECURSE_METHODS or resolved.kind == "class" or SERVICE_CREATE_RE.match(resolved.name or "") or self.uses_for(resolved.file, resolved.name)):
-                    walk(actor, resolved.file, resolved.name if resolved.kind == "class" else resolved.name, next_body, depth + 1)
-                    if target_name in {"start", "prompt"} and ("spawn" in (next_body or resolved.body or "") or "spawnProcess" in (next_body or "")):
+                next_body = resolved.methods.get(target_name) or resolved.body
+                if next_body:
+                    walk(actor, resolved.file, resolved.name, next_body, depth + 1)
+                    if "spawn" in (next_body or resolved.body or ""):
                         cmds = self.modules.get(resolved.file).spawns if resolved.file in self.modules else []
                         cmd = cmds[0] if cmds else "child process"
-                        add(actor, f"{cmd} process", "spawn", f"stdio JSONL ({cmd})", resolved.file)
+                        add(actor, f"{cmd} process", "spawn", f"spawn({cmd})", resolved.file)
 
         walk("HTTP", route.file, scope_name or Path(route.file).stem, route.body, 0)
-
-        route_mod = self.modules.get(route.file)
-        if route_mod and "session_completed" in route_mod.text:
-            add("SessionStore", "PushNotificationRegistry", "sendNotification", "on session_completed if chat view is stale", "bridge/src/push-notifications.js")
-            add("PushNotificationRegistry", "Expo Push API", "POST /api/v2/push/send", "https://exp.host/--/api/v2/push/send", "bridge/src/push-notifications.js")
-
         return steps
-
-    def _infer_transport(self, file: str) -> Optional[str]:
-        mod = self.modules.get(file)
-        if not mod:
-            return None
-        for fn in mod.functions.values():
-            if "Transport" in fn.name or "Factory" in fn.name:
-                if "OmpRpcTransport" in fn.return_news or "OmpRpcTransport" in fn.constructed:
-                    return "OmpRpcTransport"
-                if fn.return_news:
-                    return fn.return_news[-1]
-        for other in self.modules.values():
-            if is_test_path(other.file):
-                continue
-            for fn in other.functions.values():
-                if "Factory" in fn.name or "transport" in fn.name.lower():
-                    if fn.return_news:
-                        real = [n for n in fn.return_news if "Fake" not in n]
-                        return (real or fn.return_news)[-1]
-        return "OmpRpcTransport" if any("OmpRpcTransport" in m.classes for m in self.modules.values()) else None
 
     def client_for_route(self, route: Route) -> Optional[Tuple[str, str]]:
         for mod in self.modules.values():
@@ -1939,13 +1668,10 @@ class ArchitectureScanner:
             for c in comps:
                 if c["file"] in files:
                     return c
-        for rid, rt in runtimes.items():
-            if files & set(rt["files"]):
-                comps = components_by_rt.get(rid, [])
-                return next((c for c in comps if "Server" in c["name"] or c["kind"] == "entrypoint"), comps[0] if comps else None)
         return None
 
     def extract_data_flow(self, route: Optional[Route]) -> List[Tuple[str, str, str]]:
+        """Extracts direct client-to-client data flow from handler AST."""
         edges: List[Tuple[str, str, str]] = []
         seen = set()
         if not route:
@@ -2038,7 +1764,7 @@ class ArchitectureScanner:
                 if not consumer:
                     continue
                 for var_name, src_comp in var_producer.items():
-                    if re.search(r"" + re.escape(var_name) + r"", args_str):
+                    if re.search(r"\b" + re.escape(var_name) + r"\b", args_str):
                         if src_comp != consumer:
                             key = (src_comp, consumer, var_name)
                             if key not in seen:
@@ -2063,11 +1789,11 @@ class ArchitectureScanner:
             "Generated by `arch-map` using **deterministic structural AST analysis** "
             "(brace-matched JS/TS and Python AST) "
             "plus **function → import** bindings and **client data flow**. "
-            "Same codebase → same document. Zero hallucinations.\n"
+            "Same codebase -> same document. Zero hallucinations.\n"
         )
         md.append("| View | Question | Source |")
         md.append("| :--- | :--- | :--- |")
-        md.append("| **Level 1 — System context & trust boundary** | Who talks to this system, and what external dependencies lie outside our perimeter? | Entrypoints, URL literals, `spawn`, imported packages |")
+        md.append("| **Level 1 — System context & external dependencies** | Who talks to this system, and what external packages/APIs are called? | Entrypoints, URL literals, `spawn`, imported packages |")
         md.append("| **Level 2a — Control plane (wiring)** | How is the application instantiated, configured, and injected? | Factory functions, constructors, and binding graph |")
         md.append("| **Level 2b — Data plane (client data flow)** | How do internal services and storage exchange data at runtime? | Route handlers, variable passing, and client data graph |")
         md.append("| **Level 3 — Request execution flow** | What happens on a critical request end-to-end? | Route handler call-graph walk, parameter contracts, and transforms |")
@@ -2080,6 +1806,7 @@ class ArchitectureScanner:
         md.extend(self._render_level3(flow_route, runtimes))
         md.extend(self._render_routes(routes))
         md.extend(self._render_env())
+
         rendered = "\n".join(md)
         validation_errors = lint_markdown(rendered, file_path=f"<{self.repo_name} generated>")
         if validation_errors:
@@ -2100,13 +1827,12 @@ class ArchitectureScanner:
 
     def _render_level1(self, runtimes, components_by_rt, externals) -> List[str]:
         md = [
-            "## Level 1 — System context & trust boundary\n",
-            "External actors, application workload boundaries, and third-party cloud services. "
-            "Internal folders such as `test/` and `scripts/` are omitted. "
-            "Storage services use distinct semantic shapes (`[()]` databases, `[([])]` object stores).\n",
+            "## Level 1 — System context & external dependencies\n",
+            "Internal workload boundary versus external libraries, SDKs, and services. "
+            "Internal folders such as `test/` and `scripts/` are omitted.\n",
             "```mermaid",
             "flowchart TB",
-            '    subgraph ClientZone["Client Perimeter (Untrusted)"]',
+            '    subgraph ClientZone["Client Perimeter"]',
             '        User(["User / Client"])',
             '    end',
             f'    subgraph AppBoundary["Workload Boundary ({mermaid_label(self.repo_name)})"]',
@@ -2121,25 +1847,24 @@ class ArchitectureScanner:
         md.append("    end")
 
         if externals:
-            md.append('    subgraph CloudPerimeter["External Services & Managed Cloud Perimeter"]')
+            md.append('    subgraph CloudPerimeter["External Dependencies & Services"]')
             for ext in externals:
-                shape = storage_shape(ext["id"], ext["name"], ext.get("kind"))
-                md.append(f"        {shape}")
+                md.append(f'        {ext["id"]}(["{mermaid_label(ext["name"])}"])')
             md.append("    end")
 
         ui = next((rid for rid, rt in runtimes.items() if rt["kind"] == "ui"), None)
         http = next((rid for rid, rt in runtimes.items() if rt["kind"] == "http"), None)
         if ui:
-            md.append(f"    User -->|touch / type| {rt_ids[ui]}")
+            md.append(f"    User -->|interacts| {rt_ids[ui]}")
         elif http:
-            md.append(f"    User -->|HTTPS| {rt_ids[http]}")
+            md.append(f"    User -->|HTTP| {rt_ids[http]}")
         if ui and http:
-            md.append(f"    {rt_ids[ui]} -->|HTTP + Bearer| {rt_ids[http]}")
+            md.append(f"    {rt_ids[ui]} -->|HTTP| {rt_ids[http]}")
 
         http_id = rt_ids.get(http) if http else (rt_ids[next(iter(rt_ids))] if rt_ids else None)
         ui_id = rt_ids.get(ui) if ui else None
         kind_label = {
-            "http": "HTTPS", "process": "spawn", "disk": "read/write",
+            "http": "HTTPS", "process": "spawn", "disk": "fs",
             "import": "import", "device": "import",
         }
         for ext in externals:
@@ -2148,27 +1873,13 @@ class ArchitectureScanner:
                 lbl = kind_label.get(ext["kind"], ext["kind"])
                 if ext.get("evidence") and ext["evidence"] != ext["name"]:
                     lbl = f"{lbl} / {ext['evidence']}"
-                if ext["kind"] == "disk" or "telemetry" in ext["name"].lower() or "monitor" in ext["name"].lower():
-                    md.append(f"    {target_node} -.->|{mermaid_edge_label(lbl)}| {ext['id']}")
-                else:
-                    md.append(f"    {target_node} -->|{mermaid_edge_label(lbl)}| {ext['id']}")
+                md.append(f"    {target_node} -->|{mermaid_edge_label(lbl)}| {ext['id']}")
         md.append("```\n")
         if externals:
-            md.append("| External system | Kind | Semantic Type | Evidence |")
-            md.append("| :--- | :--- | :--- | :--- |")
+            md.append("| External system | Kind | Evidence |")
+            md.append("| :--- | :--- | :--- |")
             for ext in externals:
-                sem = "Database / Graph" if any(k in ext["name"].lower() for k in ("db", "cosmos", "gremlin", "sql", "mongo")) else (
-                    "Object / File Storage" if any(k in ext["name"].lower() for k in ("blob", "storage", "s3", "disk")) else (
-                        "Managed AI Service" if any(k in ext["name"].lower() for k in ("ai", "foundry", "openai")) else (
-                            "Secret Store" if any(k in ext["name"].lower() for k in ("keyvault", "secret", "vault")) else (
-                                "Telemetry / Observability" if any(k in ext["name"].lower() for k in ("monitor", "telemetry", "log")) else (
-                                    "HTTP / External API" if ext["kind"] == "http" else "Library / SDK"
-                                )
-                            )
-                        )
-                    )
-                )
-                md.append(f"| **{ext['name']}** | `{ext['kind']}` | {sem} | `{ext['evidence']}` |")
+                md.append(f"| **{ext['name']}** | `{ext['kind']}` | `{ext['evidence']}` |")
             md.append("")
         md.append("---\n")
         return md
@@ -2198,7 +1909,7 @@ class ArchitectureScanner:
         md = [
             "## Level 2b — Data plane (Client-to-client data flow)\n",
             "Runtime data-flow topology. Shows how client components pass intermediate data (arguments, return values) "
-            "to downstream storage and cloud APIs during request execution. Storage nodes use semantic shapes.\n",
+            "to downstream storage and cloud APIs during request execution.\n",
             "```mermaid",
             "flowchart LR",
         ]
@@ -2206,16 +1917,14 @@ class ArchitectureScanner:
             title = self._runtime_title(rt)
             md.append(f'    subgraph {mermaid_id("DP", rid)}["{mermaid_label(title)} Runtime"]')
             for c in components_by_rt.get(rid, []):
-                shape = storage_shape(c["id"], c["name"])
-                md.append(f'        {shape}')
+                md.append(f'        {c["id"]}["{mermaid_label(c["name"])}"]')
             md.append("    end")
 
         shown_ext = [ext for ext in externals if ext["kind"] != "import" or any(u["package"] == ext["name"] for u in self.import_uses)]
         if shown_ext:
-            md.append('    subgraph DP_Externals["External Persistence & Cloud Services"]')
+            md.append('    subgraph DP_Externals["External Dependencies & Services"]')
             for ext in shown_ext:
-                shape = storage_shape(ext["id"], ext["name"], ext.get("kind"))
-                md.append(f'        {shape}')
+                md.append(f'        {ext["id"]}(["{mermaid_label(ext["name"])}"])')
             md.append("    end")
 
         by_name = {c["name"]: c for cs in components_by_rt.values() for c in cs}
@@ -2352,6 +2061,7 @@ class ArchitectureScanner:
         md.append("")
         md.append("---\n")
         return md
+
     def _render_routes(self, routes: List[Route]) -> List[str]:
         md = ["## Routes\n"]
         if not routes:
@@ -2375,13 +2085,13 @@ class ArchitectureScanner:
         if not all_env:
             md.append("*No environment variables detected.*\n")
             return md
-        md.append("| Environment variable | Consumed in | Declared in | Type |")
-        md.append("| :--- | :--- | :--- | :--- |")
+        md.append("| Environment variable | Consumed in | Declared in |")
+        md.append("| :--- | :--- | :--- |")
         for ev in all_env:
             consumers = ", ".join(f"`{Path(p).name}`" for p in sorted(self.consumed_env_vars.get(ev, []))[:3]) or "*Declared only*"
             decls = [f"`{cf}`" for cf, vdict in self.declared_env_vars.items() if ev in vdict]
             decl = ", ".join(decls) or "*Runtime only*"
-            md.append(f"| `{ev}` | {consumers} | {decl} | {classify_env(ev)} |")
+            md.append(f"| `{ev}` | {consumers} | {decl} |")
         md.append("")
         return md
 
@@ -2394,6 +2104,7 @@ def main() -> None:
     parser.add_argument("-o", "--output", help="Output Markdown path")
     parser.add_argument("--stdout", action="store_true", help="Print Markdown to stdout")
     parser.add_argument("--route", help="Route to trace in Level 3, e.g. 'POST /message'")
+    parser.add_argument("--lsp", action="store_true", help="Enable LSP semantic reference resolution")
     parser.add_argument("--lint", nargs="?", const=".", help="Lint Markdown & Mermaid diagrams in file or directory (default: .)")
     args = parser.parse_args()
 
@@ -2435,7 +2146,7 @@ def main() -> None:
         sys.exit(1)
 
     print(f"Scanning {target_path} ...", file=sys.stderr)
-    scanner = ArchitectureScanner(str(target_path))
+    scanner = ArchitectureScanner(str(target_path), use_lsp=args.lsp)
     scanner.trace_route_spec = args.route
     scanner.scan()
     markdown_content = scanner.render_markdown()
