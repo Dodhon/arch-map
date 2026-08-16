@@ -100,6 +100,13 @@ def mermaid_label(text: str) -> str:
     return str(text).replace('"', "'").replace("\n", " ").strip()[:80]
 
 
+def mermaid_edge_label(text: str) -> str:
+    cleaned = str(text).replace('"', "'").replace("\n", " ").strip()[:80]
+    if any(c in cleaned for c in "()[]{}:,;/\\"):
+        return f'"{cleaned}"'
+    return cleaned
+
+
 def storage_shape(node_id: str, label: str, category: Optional[str] = None) -> str:
     cleaned_label = mermaid_label(label)
     cat = (category or "").lower()
@@ -107,7 +114,7 @@ def storage_shape(node_id: str, label: str, category: Optional[str] = None) -> s
     if any(k in cat or k in lbl for k in ("database", "cosmos", "postgres", "sql", "mongo", "dynamo", "gremlin", "sqlite", "table")):
         return f'{node_id}[("{cleaned_label}")]'
     if any(k in cat or k in lbl for k in ("blob", "storage", "s3", "bucket", "gcs", "disk", "file_system", "filesystem")):
-        return f'{node_id}([("{cleaned_label}")])'
+        return f'{node_id}(["{cleaned_label}"])'
     if any(k in cat or k in lbl for k in ("cache", "redis", "memcached")):
         return f'{node_id}{{{{"{cleaned_label}"}}}}'
     if any(k in cat or k in lbl for k in ("queue", "stream", "kafka", "sqs", "event", "bus")):
@@ -394,6 +401,184 @@ def parse_regex_literal(src: JsSrc, i: int) -> Tuple[str, int]:
         return "", i
     return src.s[start:slash], i
 
+
+
+# ---------------------------------------------------------------------------
+# Mermaid & Markdown Linter (Zero-Dependency Syntax & Structure Validator)
+# ---------------------------------------------------------------------------
+
+class MermaidLintError(Exception):
+    """Raised when generated or scanned Markdown contains malformed Mermaid diagrams."""
+    pass
+
+
+def lint_mermaid_flowchart(lines: List[Tuple[int, str]]) -> List[str]:
+    errors = []
+    subgraph_stack: List[Tuple[int, str]] = []
+
+    # Invalid composite delimiter sequences that break Mermaid grammar:
+    # e.g., ([("label")]) or [([label])] or ((["label"])) or [["label"]]
+    invalid_delims = [
+        (re.compile(r"\(\[\s*\(|\(\s*\[\s*\(|\(\s*\(\s*\[|\[\s*\[\s*\("), "Invalid composite opening delimiter (e.g. `([(` or `[([`)"),
+        (re.compile(r"\)\s*\]\s*\)|\)\s*\)\s*\]|\]\s*\)\s*\]"), "Invalid composite closing delimiter (e.g. `)])` or `))]`)"),
+    ]
+
+    for lineno, line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("%%"):
+            continue
+
+        if stripped.startswith("subgraph"):
+            subgraph_stack.append((lineno, stripped))
+        elif stripped == "end":
+            if not subgraph_stack:
+                errors.append(f"Line {lineno}: `end` without matching `subgraph`")
+            else:
+                subgraph_stack.pop()
+
+        # Check edge labels for unquoted special characters
+        for m in re.finditer(r"(?:-->|-\.->|==>)\|([^|]+)\|", line):
+            lbl_content = m.group(1).strip()
+            if not (lbl_content.startswith('"') and lbl_content.endswith('"')):
+                if any(c in lbl_content for c in "()[]{}"):
+                    errors.append(
+                        f"Line {lineno}: Unquoted special characters in edge label `|{lbl_content}|`. "
+                        f"Must be wrapped in quotes: `|\"{lbl_content}\"|`"
+                    )
+
+        clean = re.sub(r"%%.*$", "", line)
+        clean = re.sub(r"-->\|[^|]*\|", "-->", clean)
+        clean = re.sub(r"-\.->\|[^|]*\|", "-.->", clean)
+        clean = re.sub(r"==>\|[^|]*\|", "==>", clean)
+
+        for pat, msg in invalid_delims:
+            if pat.search(clean):
+                errors.append(f"Line {lineno}: {msg} in `{stripped}`")
+
+        # Check for unescaped / unclosed quotes in node labels on the same line
+        code_part = clean.split("%%")[0]
+        if code_part.count('"') % 2 != 0:
+            errors.append(f"Line {lineno}: Unclosed or unmatched double quotes in `{stripped}`")
+
+    if subgraph_stack:
+        for lineno, sub in subgraph_stack:
+            errors.append(f"Line {lineno}: Unclosed `subgraph`: `{sub}` (missing `end`)")
+
+    return errors
+
+
+def lint_mermaid_sequence(lines: List[Tuple[int, str]]) -> List[str]:
+    errors = []
+    block_stack: List[Tuple[int, str]] = []
+    block_keywords = re.compile(r"^(par|alt|opt|critical|loop|rect)\b")
+
+    for lineno, line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("%%"):
+            continue
+
+        m = block_keywords.match(stripped)
+        if m:
+            block_stack.append((lineno, m.group(1)))
+        elif stripped.startswith("else"):
+            if not block_stack or block_stack[-1][1] not in ("alt", "critical"):
+                errors.append(f"Line {lineno}: `else` outside `alt` or `critical` block")
+        elif stripped == "end":
+            if not block_stack:
+                errors.append(f"Line {lineno}: `end` without matching block (`par`, `alt`, `opt`, etc.)")
+            else:
+                block_stack.pop()
+
+        code_part = line.split("%%")[0]
+        if code_part.count('"') % 2 != 0:
+            errors.append(f"Line {lineno}: Unclosed or unmatched double quotes in `{stripped}`")
+
+    if block_stack:
+        for lineno, blk in block_stack:
+            errors.append(f"Line {lineno}: Unclosed sequence block `{blk}` (missing `end`)")
+
+    return errors
+
+
+def lint_mermaid(code: str, start_line: int = 1) -> List[str]:
+    lines = code.splitlines()
+    indexed_lines = [(start_line + i, line) for i, line in enumerate(lines)]
+
+    header = None
+    for lineno, line in indexed_lines:
+        s = line.strip()
+        if s and not s.startswith("%%"):
+            header = s
+            break
+
+    if not header:
+        return ["Empty Mermaid block"]
+
+    first_word = header.split()[0]
+    if first_word in ("flowchart", "graph"):
+        return lint_mermaid_flowchart(indexed_lines)
+    elif first_word == "sequenceDiagram":
+        return lint_mermaid_sequence(indexed_lines)
+    return []
+
+
+def lint_markdown(text: str, file_path: str = "") -> List[str]:
+    """Validates all Mermaid code blocks and Markdown structures in a document."""
+    errors = []
+    file_prefix = f"{file_path}: " if file_path else ""
+
+    # 1. Check for unclosed code fences
+    fence_count = len(re.findall(r"^```", text, re.M))
+    if fence_count % 2 != 0:
+        errors.append(f"{file_prefix}Unclosed Markdown code fence (found {fence_count} fence markers)")
+
+    # 2. Extract and lint all Mermaid blocks
+    pattern = re.compile(r"^```mermaid[ \t]*\n(.*?)\n^```", re.M | re.S)
+    for m in pattern.finditer(text):
+        start_line = text[:m.start()].count("\n") + 2
+        block_code = m.group(1)
+        block_errors = lint_mermaid(block_code, start_line)
+        for err in block_errors:
+            errors.append(f"{file_prefix}{err}")
+
+    # 3. Check Markdown table column consistency (outside code blocks)
+    table_lines = []
+    in_table = False
+    in_fence = False
+    for lineno, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            if in_table:
+                in_table = False
+                table_lines = []
+            continue
+
+        if in_fence:
+            continue
+
+        if stripped.startswith("|") and stripped.endswith("|"):
+            if not in_table:
+                in_table = True
+                table_lines = [(lineno, [c.strip() for c in stripped.split("|")[1:-1]])]
+            else:
+                table_lines.append((lineno, [c.strip() for c in stripped.split("|")[1:-1]]))
+        else:
+            if in_table:
+                if len(table_lines) >= 2:
+                    expected_cols = len(table_lines[0][1])
+                    for t_lineno, cols in table_lines[1:]:
+                        if all(re.match(r"^:?-+:?$", c) for c in cols if c):
+                            continue
+                        if len(cols) != expected_cols:
+                            errors.append(
+                                f"{file_prefix}Line {t_lineno}: Table column count mismatch "
+                                f"(expected {expected_cols} columns, found {len(cols)})"
+                            )
+                in_table = False
+                table_lines = []
+
+    return errors
 
 # ---------------------------------------------------------------------------
 # Module model
@@ -1895,7 +2080,14 @@ class ArchitectureScanner:
         md.extend(self._render_level3(flow_route, runtimes))
         md.extend(self._render_routes(routes))
         md.extend(self._render_env())
-        return "\n".join(md)
+        rendered = "\n".join(md)
+        validation_errors = lint_markdown(rendered, file_path=f"<{self.repo_name} generated>")
+        if validation_errors:
+            raise MermaidLintError(
+                f"Generated architecture Markdown contains Mermaid syntax errors:\n"
+                + "\n".join(f"  - {e}" for e in validation_errors)
+            )
+        return rendered
 
     def _runtime_title(self, rt: dict) -> str:
         if rt["kind"] == "ui":
@@ -1955,11 +2147,11 @@ class ArchitectureScanner:
             if target_node:
                 lbl = kind_label.get(ext["kind"], ext["kind"])
                 if ext.get("evidence") and ext["evidence"] != ext["name"]:
-                    lbl = f"{lbl} / {mermaid_label(ext['evidence'])}"
+                    lbl = f"{lbl} / {ext['evidence']}"
                 if ext["kind"] == "disk" or "telemetry" in ext["name"].lower() or "monitor" in ext["name"].lower():
-                    md.append(f"    {target_node} -.->|{lbl}| {ext['id']}")
+                    md.append(f"    {target_node} -.->|{mermaid_edge_label(lbl)}| {ext['id']}")
                 else:
-                    md.append(f"    {target_node} -->|{lbl}| {ext['id']}")
+                    md.append(f"    {target_node} -->|{mermaid_edge_label(lbl)}| {ext['id']}")
         md.append("```\n")
         if externals:
             md.append("| External system | Kind | Semantic Type | Evidence |")
@@ -1997,7 +2189,7 @@ class ArchitectureScanner:
             md.append("    end")
 
         for src, dst, label in edges:
-            md.append(f"    {src} -->|{mermaid_label(label)}| {dst}")
+            md.append(f"    {src} -->|{mermaid_edge_label(label)}| {dst}")
         md.append("```\n")
         md.append("---\n")
         return md
@@ -2033,13 +2225,13 @@ class ArchitectureScanner:
             src_c = by_name.get(src_name)
             dst_c = by_name.get(dst_name)
             if src_c and dst_c:
-                md.append(f"    {src_c['id']} -->|{mermaid_label(var_name)}| {dst_c['id']}")
+                md.append(f"    {src_c['id']} -->|{mermaid_edge_label(var_name)}| {dst_c['id']}")
 
         for u in self.import_uses:
             src = by_name.get(u["function"])
             dst = pkg_ids.get(u["package"])
             if src and dst:
-                md.append(f"    {src['id']} -->|{mermaid_label(u['binding'])}| {dst}")
+                md.append(f"    {src['id']} -->|{mermaid_edge_label(u['binding'])}| {dst}")
 
         kind_label = {"http": "HTTPS", "process": "stdio", "disk": "fs"}
         for ext in shown_ext:
@@ -2047,7 +2239,7 @@ class ArchitectureScanner:
                 continue
             owner = self._owner_component(set(ext.get("files") or ()), components_by_rt, runtimes)
             if owner:
-                md.append(f"    {owner['id']} -.->|{kind_label.get(ext['kind'], ext['kind'])}| {ext['id']}")
+                md.append(f"    {owner['id']} -.->|{mermaid_edge_label(kind_label.get(ext['kind'], ext['kind']))}| {ext['id']}")
 
         md.append("```\n")
         if self.import_uses:
@@ -2202,7 +2394,40 @@ def main() -> None:
     parser.add_argument("-o", "--output", help="Output Markdown path")
     parser.add_argument("--stdout", action="store_true", help="Print Markdown to stdout")
     parser.add_argument("--route", help="Route to trace in Level 3, e.g. 'POST /message'")
+    parser.add_argument("--lint", nargs="?", const=".", help="Lint Markdown & Mermaid diagrams in file or directory (default: .)")
     args = parser.parse_args()
+
+    if args.lint is not None:
+        lint_target = Path(args.lint).resolve()
+        if not lint_target.exists():
+            print(f"Error: Lint target path does not exist: {lint_target}", file=sys.stderr)
+            sys.exit(1)
+        files_to_lint = []
+        if lint_target.is_file():
+            files_to_lint.append(lint_target)
+        else:
+            files_to_lint.extend(sorted(lint_target.rglob("*.md")))
+
+        all_errors: List[str] = []
+        for file in files_to_lint:
+            if any(part in IGNORE_DIRS for part in file.parts):
+                continue
+            try:
+                content = file.read_text(encoding="utf-8", errors="ignore")
+                rel_path = posix(file.relative_to(lint_target if lint_target.is_dir() else lint_target.parent))
+                errors = lint_markdown(content, file_path=rel_path)
+                all_errors.extend(errors)
+            except Exception as e:
+                all_errors.append(f"{file}: Failed to read file: {e}")
+
+        if all_errors:
+            print(f"❌ Markdown & Mermaid Lint Failed ({len(all_errors)} issues found):", file=sys.stderr)
+            for err in all_errors:
+                print(f"  - {err}", file=sys.stderr)
+            sys.exit(1)
+        else:
+            print(f"✅ All {len(files_to_lint)} Markdown & Mermaid files passed validation cleanly.", file=sys.stderr)
+            sys.exit(0)
 
     target_path = Path(args.target).resolve()
     if not target_path.exists():

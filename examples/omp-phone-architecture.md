@@ -25,7 +25,7 @@ flowchart TB
         RT_client["Client app\nindex.js"]
     end
     subgraph CloudPerimeter["External Services & Managed Cloud Perimeter"]
-        X_react_native_async_storage_async_storage([("@react-native-async-storage/async-storage")])
+        X_react_native_async_storage_async_storage(["@react-native-async-storage/async-storage"])
         X_Expo_Push_API["Expo Push API"]
         X_codex_process["codex process"]
         X_expo_file_system_legacy["expo-file-system/legacy"]
@@ -33,19 +33,19 @@ flowchart TB
         X_expo_secure_store["expo-secure-store"]
         X_omp_process["omp process"]
         X_Internet_probe["Internet probe"]
-        X_Local_session_files([("Local session files")])
+        X_Local_session_files(["Local session files"])
     end
     User -->|touch / type| RT_client
     RT_client -->|HTTP + Bearer| RT_bridge
-    RT_bridge -->|import / AsyncStorage| X_react_native_async_storage_async_storage
-    RT_bridge -->|HTTPS / https://exp.host/--/api/v2/push/send| X_Expo_Push_API
-    RT_bridge -->|spawn / spawn(codex)| X_codex_process
-    RT_bridge -->|import / FileSystem| X_expo_file_system_legacy
-    RT_bridge -->|import / ImagePicker| X_expo_image_picker
-    RT_bridge -->|import / SecureStore| X_expo_secure_store
-    RT_bridge -->|spawn / spawn(omp)| X_omp_process
-    RT_bridge -->|HTTPS / https://www.gstatic.com/generate_204| X_Internet_probe
-    RT_bridge -.->|read/write / bridge/src/omp-usage.js| X_Local_session_files
+    RT_bridge -->|"import / AsyncStorage"| X_react_native_async_storage_async_storage
+    RT_bridge -->|"HTTPS / https://exp.host/--/api/v2/push/send"| X_Expo_Push_API
+    RT_bridge -->|"spawn / spawn(codex)"| X_codex_process
+    RT_bridge -->|"import / FileSystem"| X_expo_file_system_legacy
+    RT_bridge -->|"import / ImagePicker"| X_expo_image_picker
+    RT_bridge -->|"import / SecureStore"| X_expo_secure_store
+    RT_bridge -->|"spawn / spawn(omp)"| X_omp_process
+    RT_bridge -->|"HTTPS / https://www.gstatic.com/generate_204"| X_Internet_probe
+    RT_bridge -.->|"read/write / bridge/src/omp-usage.js"| X_Local_session_files
 ```
 
 | External system | Kind | Semantic Type | Evidence |
@@ -130,7 +130,7 @@ flowchart LR
         C_takePicture["takePicture"]
     end
     subgraph DP_Externals["External Persistence & Cloud Services"]
-        X_react_native_async_storage_async_storage([("@react-native-async-storage/async-storage")])
+        X_react_native_async_storage_async_storage(["@react-native-async-storage/async-storage"])
         X_Expo_Push_API["Expo Push API"]
         X_codex_process["codex process"]
         X_expo_file_system_legacy["expo-file-system/legacy"]
@@ -138,7 +138,7 @@ flowchart LR
         X_expo_secure_store["expo-secure-store"]
         X_omp_process["omp process"]
         X_Internet_probe["Internet probe"]
-        X_Local_session_files([("Local session files")])
+        X_Local_session_files(["Local session files"])
     end
     C_App -->|ImagePicker| X_expo_image_picker
     C_App -->|FileSystem| X_expo_file_system_legacy

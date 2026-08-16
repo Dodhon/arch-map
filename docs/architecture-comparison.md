@@ -11,7 +11,7 @@
 | **Trust Boundaries** | Single boundary around codebase | Demarcates Public User, Ingress Auth, App Boundary, Cloud APIs | Identifies attack surface and auth perimeter |
 | **Control Plane vs Data Plane** | Mixed together in Level 2 | Split into **2a (Wiring/Injection)** and **2b (Data-Flow Topology)** | Conforms to Amazon Principal Engineering standard |
 | **Client-to-Client Data Flow** | Functions point only at imports | Direct edges showing data handoff (Graph $\rightarrow$ Foundry $\rightarrow$ Cosmos) | Answers *"How do cloud services exchange data?"* |
-| **Storage Semantics** | Generic rectangular import boxes | Cylinders `[()]` for DBs, Disks `[([])]` for Object Stores | Instant visual distinction of persistence tiers |
+| **Storage Semantics** | Generic rectangular import boxes | Cylinders `[()]` for DBs, Disks `([""])` for Object Stores | Instant visual distinction of persistence tiers |
 | **Transport Semantics** | Solid arrows for all calls | Solid for synchronous RPC; dotted for async/event paths | Highlights blocking latency and decoupling points |
 | **Failure Modes & Fallbacks** | Happy path only | Sequence diagrams include `alt / opt` error & fallback branches | SRE/Resilience review ready (Chaos / Circuit Breakers) |
 
@@ -67,7 +67,7 @@ flowchart TB
     subgraph CloudPerimeter["Azure Cloud Managed Services (Secured by DefaultAzureCredential)"]
         Foundry["Azure AI Foundry\nazure.ai.projects"]
         KeyVault["Azure Key Vault\nazure.keyvault.secrets"]
-        BlobStore[([Azure Blob Storage\nazure.storage.blob])]
+        BlobStore(["Azure Blob Storage\nazure.storage.blob"])
         CosmosDB[(Azure Cosmos DB\nazure.cosmos)]
         Gremlin[(Cosmos Gremlin Graph\ngremlin_python...)]
         AppInsights["Application Insights\nazure.monitor.opentelemetry"]
@@ -163,7 +163,7 @@ flowchart LR
     Handler["chat() Handler"]
 
     subgraph StorageAndAI["External Persistence & AI Services"]
-        BlobStore[([BlobStore\nazure.storage.blob])]
+        BlobStore(["BlobStore\nazure.storage.blob"])
         GraphIndex[(GraphIndex\ngremlin_python...)]
         FoundryAgent["FoundryAgent\nazure.ai.projects"]
         CosmosStore[(CosmosStore\nazure.cosmos)]
@@ -171,7 +171,7 @@ flowchart LR
         Telemetry["Telemetry\nazure.monitor.query"]
     end
 
-    Client -->|1. POST /chat {text, attachments}| Handler
+    Client -->|"1. POST /chat {text, attachments}"| Handler
     Handler -.->|track start| Telemetry
     Handler -->|fetch endpoint config| SecretReader
     Handler -->|2. put files| BlobStore
@@ -185,7 +185,7 @@ flowchart LR
     Handler -->|6. upsert session turn| CosmosStore
 
     CosmosStore -->|7. commit turn| Handler
-    Handler -->|8. 200 JSON {answer}| Client
+    Handler -->|"8. 200 JSON {answer}"| Client
 ```
 
 ---
@@ -299,7 +299,7 @@ sequenceDiagram
 
 2. **Storage Semantic Decorator**:
    - Detect storage packages (`@azure/storage-blob`, `azure-storage-blob`, `aws-sdk/s3`, `mongodb`, `cosmos`, `redis`, `pg`, `sql`).
-   - Emit Mermaid storage shapes: `[(Database)]`, `[([Object Store])]`, `{{Cache}}`.
+   - Emit Mermaid storage shapes: `[(Database)]`, `(["Object Store"])`, `{{Cache}}`.
 
 3. **Control Plane / Data Plane Partitioning**:
    - Automatically separate functions matching `create_*` or constructors from request handler scopes (`@app.post`, `handle()`).

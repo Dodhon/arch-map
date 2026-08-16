@@ -30,20 +30,20 @@ flowchart TB
         X_azure_keyvault_secrets["azure.keyvault.secrets"]
         X_azure_monitor_opentelemetry["azure.monitor.opentelemetry"]
         X_azure_monitor_query["azure.monitor.query"]
-        X_azure_storage_blob([("azure.storage.blob")])
+        X_azure_storage_blob(["azure.storage.blob"])
         X_fastapi["fastapi"]
         X_gremlin_python_driver_driver_remote_connection[("gremlin_python.driver.driver_remote_connection")]
     end
     User -->|HTTPS| RT_src
-    RT_src -->|import / AIProjectClient| X_azure_ai_projects
-    RT_src -->|import / CosmosClient| X_azure_cosmos
-    RT_src -->|import / DefaultAzureCredential| X_azure_identity
-    RT_src -->|import / SecretClient| X_azure_keyvault_secrets
-    RT_src -.->|import / configure_azure_monitor| X_azure_monitor_opentelemetry
-    RT_src -.->|import / LogsQueryClient| X_azure_monitor_query
-    RT_src -->|import / BlobServiceClient| X_azure_storage_blob
-    RT_src -->|import / FastAPI| X_fastapi
-    RT_src -->|import / DriverRemoteConnection| X_gremlin_python_driver_driver_remote_connection
+    RT_src -->|"import / AIProjectClient"| X_azure_ai_projects
+    RT_src -->|"import / CosmosClient"| X_azure_cosmos
+    RT_src -->|"import / DefaultAzureCredential"| X_azure_identity
+    RT_src -->|"import / SecretClient"| X_azure_keyvault_secrets
+    RT_src -.->|"import / configure_azure_monitor"| X_azure_monitor_opentelemetry
+    RT_src -.->|"import / LogsQueryClient"| X_azure_monitor_query
+    RT_src -->|"import / BlobServiceClient"| X_azure_storage_blob
+    RT_src -->|"import / FastAPI"| X_fastapi
+    RT_src -->|"import / DriverRemoteConnection"| X_gremlin_python_driver_driver_remote_connection
 ```
 
 | External system | Kind | Semantic Type | Evidence |
@@ -99,13 +99,13 @@ Runtime data-flow topology. Shows how client components pass intermediate data (
 flowchart LR
     subgraph DP_src["HTTP service Runtime"]
         C_create_app["create_app"]
-        C_create_blob_store([("create_blob_store")])
+        C_create_blob_store(["create_blob_store"])
         C_create_cosmos_store[("create_cosmos_store")]
         C_create_foundry_agent["create_foundry_agent"]
         C_create_graph_index["create_graph_index"]
         C_create_secret_reader["create_secret_reader"]
         C_create_telemetry["create_telemetry"]
-        C_BlobStore([("BlobStore")])
+        C_BlobStore(["BlobStore"])
         C_CosmosStore[("CosmosStore")]
         C_FoundryAgent["FoundryAgent"]
         C_GraphIndex["GraphIndex"]
@@ -119,7 +119,7 @@ flowchart LR
         X_azure_keyvault_secrets["azure.keyvault.secrets"]
         X_azure_monitor_opentelemetry["azure.monitor.opentelemetry"]
         X_azure_monitor_query["azure.monitor.query"]
-        X_azure_storage_blob([("azure.storage.blob")])
+        X_azure_storage_blob(["azure.storage.blob"])
         X_fastapi["fastapi"]
         X_gremlin_python_driver_driver_remote_connection[("gremlin_python.driver.driver_remote_connection")]
     end

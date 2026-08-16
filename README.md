@@ -42,6 +42,9 @@ arch-map /path/to/my-project -o ./ARCHITECTURE.md
 
 # Print directly to terminal
 arch-map . --stdout
+
+# Lint all Markdown and Mermaid diagrams in a directory or file
+arch-map --lint .
 ```
 
 ---

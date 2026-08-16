@@ -96,6 +96,6 @@ Distilled from the C4 Model (Simon Brown) and Big Tech review standards:
 ## 5. Next Steps for `arch-map`
 
 1. **Implement Level 2b (Client Data-Flow Graph)**: Statically trace variable assignments into downstream function calls to draw direct client-to-client data edges.
-2. **Add Storage Semantic Shapes**: Automatically assign database cylinders `[(Cosmos / Postgres)]` and object-storage shapes `[([Blob / S3])]` based on SDK classification.
+2. **Add Storage Semantic Shapes**: Automatically assign database cylinders `[(Cosmos / Postgres)]` and object-storage shapes `(["Blob / S3"])` based on SDK classification.
 3. **Separate Control Plane from Data Plane**: Distinguish factory initialization (`create_app`) from runtime execution (`chat()`).
 4. **Extract Fallback Branches**: Detect `try/except` handlers and render error paths in sequence diagrams.
