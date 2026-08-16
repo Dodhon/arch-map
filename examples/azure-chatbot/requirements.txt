@@ -1,0 +1,10 @@
+azure-ai-projects
+azure-identity
+azure-storage-blob
+azure-cosmos
+azure-keyvault-secrets
+azure-monitor-opentelemetry
+azure-monitor-query
+gremlinpython
+fastapi
+uvicorn
